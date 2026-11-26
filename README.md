@@ -54,7 +54,8 @@ The analysis is syntactic; nothing is renamed or typechecked.
 
 - A declaration depends on another when it mentions a name the other binds. A local variable that shadows a top-level name counts as a mention, which can make groups larger but never wrong.
 - Signatures, fixity declarations and pragmas join the declaration they name.
-- An instance joins its class when the module defines it, and otherwise the first type in its head that the module defines. An instance with neither is reported as an orphan.
+- An instance joins its class when the module defines it, and otherwise the first type in its head that the module defines.
+- An instance with neither is an orphan. A module's orphans share one fragment, `S_orphans`, since they can use one another. Every other fragment of the module imports it, except the ones the orphans depend on.
 - Mutually dependent declarations form one group.
 
 ## Which imports a fragment keeps
@@ -68,10 +69,27 @@ An import that brings in everything, hides names, lists a type with `(..)`, or l
 
 The module's header comment is not copied, so editing it changes only the facade.
 
+## Importing other modules' fragments
+
+By default a fragment imports other modules of the package as the original did, so it waits for the whole of each. With `--direct`, and every module of the package given in one run, a fragment imports the fragments that bind the names it uses:
+
+```
+cabal run cabal-shatter -- --split --direct --out SOURCE-DIR FILE ...
+```
+
+- The splitter works out what each module exports from its export list and imports, following re-exports inside the package.
+- An import is kept as written when a name the fragment uses might come from outside the package, for example through a module that re-exports an external one.
+- A type is imported with everything that belongs to it, less whatever the original import hid or the module binds itself.
+- Every newtype the original import brought in is imported, used or not, because coercing through a newtype needs its constructor in scope.
+- Every fragment imports, with an empty list, the orphan fragments its module could reach, and any reachable module that couldn't be split and declares instances.
+
+The run ends with how many imports were replaced and which modules' imports were kept most often.
+
 ## Limits
 
 - Modules that use CPP are refused.
-- Modules with top-level Template Haskell splices or orphan instances are reported but not split.
+- Modules with top-level Template Haskell splices or an hs-boot file are reported but not split.
+- With `--direct`, an orphan instance that reaches a fragment only through a module outside the package can be lost, and so can the constructor of an external newtype.
 - A module that uses `RebindableSyntax` may lose an import it needs, because the names that syntax refers to are not written in the source.
 - Whole-module warnings for unused imports and unused top-level bindings are turned off in the fragments.
 - The `ghc` library ties the build to one compiler version, GHC 10.0 at present.

@@ -25,6 +25,7 @@ library
   hs-source-dirs:  src
   exposed-modules:
     Shatter.Graph
+    Shatter.Index
     Shatter.Parse
     Shatter.Report
     Shatter.Split
@@ -45,4 +46,5 @@ executable cabal-shatter
   build-depends:
     , base
     , cabal-shatter
+    , containers
     , directory

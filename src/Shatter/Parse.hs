@@ -14,6 +14,7 @@ import GHC
   ( GhcPs
   , HsModule (..)
   , LHsDecl
+  , LIE
   , LImportDecl
   , getLocA
   , getSessionDynFlags
@@ -47,6 +48,8 @@ data Parsed = Parsed
   -- ^ The file's lines.
   , parsedNameLine :: Maybe Int
   -- ^ The line the module's name is on, when it has a header.
+  , parsedExports :: Maybe [LIE GhcPs]
+  -- ^ The export list, when the header has one.
   , parsedHasExports :: Bool
   -- ^ Whether the header has an export list.
   , parsedImportLines :: Maybe (Int, Int)
@@ -89,6 +92,7 @@ parseFile withGhc extraFlags path = do
                     , parsedImports = hsmodImports m
                     , parsedSource = lines src
                     , parsedNameLine = fst <$> (lineSpan . getLocA =<< hsmodName m)
+                    , parsedExports = unLoc <$> hsmodExports m
                     , parsedHasExports = isJust $ hsmodExports m
                     , parsedImportLines = case mapMaybe (lineSpan . getLocA) $ hsmodImports m of
                         [] -> Nothing

@@ -3,7 +3,11 @@
 module Shatter.Split
   ( Fragment (..)
   , Split (..)
+  , Plan (..)
   , split
+  , plan
+  , planEntry
+  , render
   , writeSplit
   , WriteResult (..)
   ) where
@@ -11,7 +15,7 @@ module Shatter.Split
 import Control.Exception (evaluate)
 import Control.Monad (forM, forM_, unless)
 import Data.Char (isAlphaNum, ord)
-import Data.List (intercalate, isInfixOf, isPrefixOf, isSuffixOf, sort, sortOn)
+import Data.List (intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub, sort, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as Set
@@ -29,7 +33,34 @@ import GHC
   , unLoc
   )
 import Numeric (showHex)
-import Shatter.Graph (Group (..), Kind (..), Node (..), Used (..), collect, declGroups, declNodes, usedIn)
+import Shatter.Graph
+  ( Group (..)
+  , Item (..)
+  , Kind (..)
+  , Node (..)
+  , Used (..)
+  , collect
+  , declGroups
+  , declNodes
+  , usedIn
+  , usedQualifiers
+  , wrap
+  )
+import Shatter.Index
+  ( Bound (..)
+  , Entry (..)
+  , Found (..)
+  , ImportSpec (..)
+  , Info (..)
+  , Package (..)
+  , allows
+  , exportsOf
+  , find
+  , importSpec
+  , newtypes
+  , orphanModules
+  , picks
+  )
 import Shatter.Parse (Parsed (..), lineSpan)
 import System.Directory
   ( createDirectoryIfMissing
@@ -54,22 +85,43 @@ data Split = Split
   { splitModule :: String
   , splitFacade :: String
   , splitFragments :: [Fragment]
+  , splitDirect :: Int
+  -- ^ How many imports of other modules in the package were replaced by
+  -- imports of their fragments.
+  , splitKept :: [String]
+  -- ^ The modules whose imports were kept as written because a name
+  -- couldn't be traced, once for each fragment that kept one.
   }
 
--- | Split a parsed module, or say why it can't be split.
+-- | How a module will be split, before any text is written.
+data Plan = Plan
+  { planParsed :: Parsed
+  , planNodes :: [Node]
+  , planGroups :: [Group]
+  , planNames :: Map.Map Int String
+  -- ^ The fragment module for each group.
+  , planHeaderEnd :: Int
+  -- ^ The last line of the header and imports.
+  }
+
+-- | Split a parsed module on its own, or say why it can't be split.
 split :: Parsed -> Either String Split
-split parsed
+split = fmap (render Nothing) . plan
+
+-- | Work out the groups and their names, or say why the module can't be
+-- split.
+plan :: Parsed -> Either String Plan
+plan parsed
   | not (null splices) = refuse $ "has top-level splices at lines " ++ linesOf splices
-  | not (null orphans) = refuse $ "has orphan instances at lines " ++ linesOf orphans
   | otherwise = do
       headerEnd <- header
-      let slices = declSlices headerEnd (parsedDecls parsed)
-          fragments = map (fragment slices) groups
       pure
-        Split
-          { splitModule = modName
-          , splitFacade = facade headerEnd $ map fragmentModule fragments
-          , splitFragments = fragments
+        Plan
+          { planParsed = parsed
+          , planNodes = nodes
+          , planGroups = groups
+          , planNames = fragmentNames modName groups
+          , planHeaderEnd = headerEnd
           }
   where
     modName = parsedName parsed
@@ -77,17 +129,9 @@ split parsed
     nodes = declNodes modName (parsedDecls parsed)
     groups = sortOn groupId $ declGroups nodes
     splices = filter ((== Splice) . nodeKind) nodes
-    orphans = filter nodeOrphan nodes
     linesOf = intercalate ", " . map (show . nodeFirstLine)
     refuse why = Left $ modName ++ ": " ++ why ++ ", which the splitter does not handle"
 
-    slice (first, final) = take (final - first + 1) $ drop (first - 1) src
-
-    -- The pragmas above the module's name. The header comment is left
-    -- behind, so that editing it doesn't change every fragment.
-    pragmas = pragmaLines . maybe [] (\n -> take (n - 1) src) $ parsedNameLine parsed
-
-    -- The last line of the header and imports.
     header = case (parsedImportLines parsed, parsedNameLine parsed) of
       (Just (_, final), _) -> Right final
       (Nothing, Just n) ->
@@ -96,37 +140,112 @@ split parsed
           [] -> refuse "has a header whose end can't be found"
       (Nothing, Nothing) -> Right 0
 
-    imports = [(s, importNeeded $ unLoc i) | i <- parsedImports parsed, Just s <- [lineSpan $ getLocA i]]
+-- | What the rest of the package needs to know about a planned module.
+planEntry :: Plan -> (String, Entry)
+planEntry p =
+  ( parsedName $ planParsed p
+  , Known
+      Info
+        { infoBinders =
+            Map.fromListWith
+              (flip (++))
+              [ (itemName i, [Bound (name g) (itemHead i) (itemType i) (itemParent i) (itemNewtype i)])
+              | g <- planGroups p
+              , n <- groupNodes g
+              , i <- nodeItems n
+              ]
+        , infoExports = exportsOf (parsedName $ planParsed p) . parsedExports $ planParsed p
+        , infoImports = importSpec . unLoc <$> parsedImports (planParsed p)
+        , infoOrphans = [name g | g <- planGroups p, not . null $ groupOrphan g]
+        }
+  )
+  where
+    name g = fromMaybe (error "shatter: group without a name") . Map.lookup (groupId g) $ planNames p
+
+-- | Write out a planned module. Given the package's index, a fragment
+-- imports the fragments of other modules that bind the names it uses,
+-- where it would otherwise import those modules whole.
+render :: Maybe Package -> Plan -> Split
+render index p =
+  Split
+    { splitModule = modName
+    , splitFacade = facade
+    , splitFragments = [f | (f, _, _) <- rendered]
+    , splitDirect = sum [n | (_, n, _) <- rendered]
+    , splitKept = concat [k | (_, _, k) <- rendered]
+    }
+  where
+    parsed = planParsed p
+    modName = parsedName parsed
+    src = parsedSource parsed
+    groups = planGroups p
+    slices = declSlices (planHeaderEnd p) (parsedDecls parsed)
+    rendered = map fragment groups
+
+    slice (first, final) = take (final - first + 1) $ drop (first - 1) src
+
+    -- The pragmas above the module's name. The header comment is left
+    -- behind, so that editing it doesn't change every fragment.
+    pragmas = pragmaLines . maybe [] (\n -> take (n - 1) src) $ parsedNameLine parsed
+
+    imports = [(s, unLoc i) | i <- parsedImports parsed, Just s <- [lineSpan $ getLocA i]]
 
     decls = Map.fromList . zip [0 :: Int ..] $ parsedDecls parsed
 
-    names :: Map.Map Int String
-    names = fragmentNames modName groups
+    locals = Set.fromList $ concatMap nodeBinds (planNodes p)
 
-    nameOf gid = fromMaybe (error "shatter: group without a name") $ Map.lookup gid names
+    nameOf gid = fromMaybe (error "shatter: group without a name") . Map.lookup gid $ planNames p
 
-    fragment slices g =
+    -- The orphan instances that the module could see through its imports.
+    orphans = case index of
+      Nothing -> []
+      Just pkg ->
+        [ "import " ++ o ++ " ()"
+        | o <- Set.toList . Set.fromList $ concatMap (orphanModules (packageIndex pkg) . importModule . importSpec . snd) imports
+        , o /= modName
+        ]
+
+    fragment g =
       let own = [(nodeId n, s) | n <- groupNodes g, Just s <- [Map.lookup (nodeId n) slices]]
           used = foldMap usedIn [d | n <- groupNodes g, Just d <- [Map.lookup (nodeId n) decls]]
-          importBlock = concat [slice s | (s, needed) <- imports, needed used]
+          resolved = [importLines used s d | (s, d) <- imports]
           top =
             pragmas
-              ++ [ "{-# OPTIONS_GHC -Wno-unused-imports -Wno-unused-top-binds -Wno-missing-export-lists #-}"
+              ++ [ "{-# OPTIONS_GHC -Wno-unused-imports -Wno-unused-top-binds -Wno-missing-export-lists -Wno-dodgy-imports -Wno-orphans #-}"
                  , "module " ++ nameOf (groupId g) ++ " where"
                  , ""
                  ]
-              ++ importBlock
+              ++ concat [ls | (ls, _, _) <- resolved]
+              ++ orphans
               ++ defaults
-              ++ [sibling $ nameOf d | d <- sort $ groupDeps g]
+              ++ [sibling $ nameOf d | d <- sort . nub $ groupDeps g]
           place (line, acc, text) (_, s@(first, final)) =
             let body = slice s
              in (line + length body + 1, (line + 1, first, final - first + 1) : acc, text ++ [""] ++ body)
           (_, placed, textLines) = foldl place (length top, [], top) own
-       in Fragment
-            { fragmentModule = nameOf (groupId g)
-            , fragmentText = unlines textLines
-            , fragmentSlices = reverse placed
-            }
+       in ( Fragment
+              { fragmentModule = nameOf (groupId g)
+              , fragmentText = unlines textLines
+              , fragmentSlices = reverse placed
+              }
+          , length [() | (_, True, _) <- resolved]
+          , concat [k | (_, _, k) <- resolved]
+          )
+
+    -- The lines for one of the module's imports in a fragment, whether it
+    -- was replaced by imports of fragments, and the module if it had to be
+    -- kept as written.
+    importLines used s d = case index of
+      Just pkg
+        | Just (Known _) <- Map.lookup (importModule spec) (packageIndex pkg)
+        , not (importSource spec) ->
+            case direct pkg locals used spec of
+              Just ls -> (ls, True, [])
+              Nothing -> (asWritten, False, [importModule spec | importNeeded d used])
+      _ -> (asWritten, False, [])
+      where
+        spec = importSpec d
+        asWritten = if importNeeded d used then slice s else []
 
     -- @default@ declarations apply to a whole module, so every fragment
     -- gets a copy.
@@ -137,17 +256,75 @@ split parsed
     -- @module M@ from the facade covers what the fragments define.
     sibling m = "import " ++ m ++ " as " ++ modName
 
-    facade headerEnd fragmentModules =
+    facade =
       unlines $
         ["{-# OPTIONS_GHC -Wno-unused-imports #-}"]
-          ++ (if parsedHasExports parsed then take headerEnd src else generatedHeader)
-          ++ map sibling fragmentModules
+          ++ (if parsedHasExports parsed then take (planHeaderEnd p) src else generatedHeader)
+          ++ map (sibling . nameOf . groupId) groups
 
     -- With no export list the original exported everything it defined.
     generatedHeader =
       pragmas
         ++ ["module " ++ modName ++ " (module " ++ modName ++ ") where", ""]
         ++ maybe [] slice (parsedImportLines parsed)
+
+-- | Imports of the fragments that bind the names a fragment uses from one
+-- import of a split module. 'Nothing' when one of those names might come
+-- from outside the package, or needs import syntax this program doesn't
+-- write; the import is then kept as it was.
+--
+-- A name written without a qualifier is only looked for when the module
+-- doesn't bind it itself, and only when the import's own list lets it in.
+--
+-- Every newtype the import brings in is imported too, used or not:
+-- coercing through a newtype needs its constructor in scope.
+direct :: Package -> Set.Set String -> Used -> ImportSpec -> Maybe [String]
+direct pkg locals used spec
+  | any (foundUnsure . snd) founds = Nothing
+  | otherwise = do
+      entries <- traverse entry bounds
+      pure
+        [ concat
+            [ "import "
+            , if importQualifiedOnly spec then "qualified " else ""
+            , m
+            , " as "
+            , importQualifier spec
+            , " ("
+            , intercalate ", " $ Set.toList items
+            , ")"
+            ]
+        | (m, items) <- Map.toList $ Map.fromListWith (<>) [(m, Set.singleton item) | (m, item) <- entries]
+        ]
+  where
+    qualified = [x | (q, x) <- Set.toList $ usedQualified used, q == importQualifier spec]
+    unqualified
+      | importQualifiedOnly spec = []
+      | otherwise = filter (`Set.notMember` locals) . Set.toList $ usedUnqualified used
+    candidates = filter (allows $ importList spec) . nub $ qualified ++ unqualified
+    founds = [(x, find pkg (importModule spec) x) | x <- candidates]
+    bounds =
+      nub $
+        [b | (x, f) <- founds, b <- foundBounds f, listed x b]
+          ++ [b | (x, b) <- newtypes pkg (importModule spec), allows (importList spec) x, listed x b, clear x]
+    listed = picks $ importList spec
+
+    -- Whether a name can come into scope without clashing with one the
+    -- module binds or one the import leaves out.
+    clear c = (importQualifiedOnly spec || c `Set.notMember` locals) && allows (importList spec) c
+
+    -- A type is imported with everything that belongs to it, unless some
+    -- of that would clash; then with the rest by name.
+    entry b = do
+      name <- boundHead b
+      pure . (,) (boundModule b) $
+        if boundType b
+          then
+            let children = Map.findWithDefault [] (boundModule b, name) $ packageChildren pkg
+             in if all clear children
+                  then name ++ "(..)"
+                  else name ++ "(" ++ intercalate ", " (map wrap $ filter clear children) ++ ")"
+          else wrap name
 
 -- | Whether a fragment that mentions the given names could need an import.
 --
@@ -210,7 +387,9 @@ fragmentNames modName groups = Map.fromList $ concatMap number byName
       n : _
         | all (\c -> isAlphaNum c || c == '_' || c == '\'') n -> n
         | otherwise -> "op_" ++ concatMap (flip showHex "" . ord) n
-      [] -> "line" ++ show (nodeFirstLine . minimumOn nodeId $ groupNodes g)
+      []
+        | not (null $ groupOrphan g) -> "orphans"
+        | otherwise -> "line" ++ show (nodeFirstLine . minimumOn nodeId $ groupNodes g)
     minimumOn f = foldr1 (\a b -> if f a <= f b then a else b)
 
 -- | What 'writeSplit' did.

@@ -9,15 +9,20 @@
 -- dependencies, which makes groups larger but never wrong.
 module Shatter.Graph
   ( Node (..)
+  , Item (..)
   , Kind (..)
   , Group (..)
   , declNodes
   , declGroups
   , Used (..)
+  , usedQualifiers
   , usedIn
+  , rdr
+  , wrap
   , collect
   ) where
 
+import Data.Char (isAlphaNum)
 import Data.Data (Data, gmapQ)
 import Data.Foldable (toList)
 import Data.Graph (flattenSCC, stronglyConnComp)
@@ -56,6 +61,8 @@ data Node = Node
   , nodeKind :: Kind
   , nodeBinds :: [String]
   -- ^ The names it brings into scope at the top level.
+  , nodeItems :: [Item]
+  -- ^ The same names, with how another module would import each.
   , nodeWith :: [String]
   -- ^ Names whose declaration it has to share a module with: the function
   -- for a signature, the class or type for an instance.
@@ -67,12 +74,33 @@ data Node = Node
   -- ^ An instance whose class and types all come from other modules.
   }
 
+-- | A name a declaration binds.
+data Item = Item
+  { itemName :: String
+  , itemHead :: Maybe String
+  -- ^ The name to write in an import list to bring it into scope: its own
+  -- name for a function, the type or class for anything that belongs to
+  -- one. 'Nothing' when it needs syntax this program doesn't write, such
+  -- as a pattern synonym.
+  , itemType :: Bool
+  -- ^ Whether 'itemHead' is a type or class, which is imported with what
+  -- belongs to it.
+  , itemParent :: Maybe String
+  -- ^ The type or class a constructor, field or method belongs to.
+  , itemNewtype :: Bool
+  -- ^ Whether it is a newtype. Coercing through a newtype needs its
+  -- constructor in scope, and nothing in the source says so.
+  }
+
 -- | Declarations that have to be compiled together.
 data Group = Group
   { groupId :: Int
   -- ^ The position of its first declaration, which identifies the group.
   , groupDeps :: [Int]
   -- ^ The other groups it mentions a name from.
+  , groupOrphan :: [String]
+  -- ^ For a group that is an orphan instance, the names in the instance
+  -- head; otherwise empty.
   , groupNodes :: [Node]
   , groupLines :: Int
   , groupNames :: [String]
@@ -86,7 +114,7 @@ declNodes :: String -> [LHsDecl GhcPs] -> [Node]
 declNodes modName = markOrphans . mapMaybe node . zip [0 ..]
   where
     node (i, L ann decl) = do
-      (kind, binds, with) <- classify decl
+      (kind, items, with) <- classify decl
       let (first, final) = case locA ann of
             RealSrcSpan s _ -> (srcSpanStartLine s, srcSpanEndLine s)
             _ -> (0, 0)
@@ -94,7 +122,8 @@ declNodes modName = markOrphans . mapMaybe node . zip [0 ..]
         Node
           { nodeId = i
           , nodeKind = kind
-          , nodeBinds = nub binds
+          , nodeBinds = nub $ map itemName items
+          , nodeItems = items
           , nodeWith = nub with
           , nodeUses = nub $ namesIn modName decl
           , nodeFirstLine = first
@@ -102,24 +131,28 @@ declNodes modName = markOrphans . mapMaybe node . zip [0 ..]
           , nodeOrphan = False
           }
 
-    classify :: HsDecl GhcPs -> Maybe (Kind, [String], [String])
+    classify :: HsDecl GhcPs -> Maybe (Kind, [Item], [String])
     classify = \case
-      ValD _ bind -> Just (Value, rdr <$> collectHsBindBinders CollNoDictBinders bind, [])
-      TyClD _ d -> Just (TypeOrClass, tyClBinders d, [])
+      ValD _ bind@PatSynBind{} -> Just (Value, unimportable . rdr <$> collectHsBindBinders CollNoDictBinders bind, [])
+      ValD _ bind -> Just (Value, value . rdr <$> collectHsBindBinders CollNoDictBinders bind, [])
+      TyClD _ d -> Just (TypeOrClass, tyClItems d, [])
       InstD _ (ClsInstD _ inst) -> Just (Instance, [], instanceHead $ cid_poly_ty inst)
-      InstD _ d@DataFamInstD{} -> Just (Instance, conBinders d, [])
+      InstD _ d@DataFamInstD{} -> Just (Instance, unimportable <$> conBinders d, [])
       InstD _ _ -> Just (Instance, [], [])
       DerivD _ d -> Just (Instance, [], instanceHead . hswc_body $ deriv_type d)
       SigD _ sig -> Just (Attached, [], sigSubjects sig)
       KindSigD _ (StandaloneKindSig _ n _) -> Just (Attached, [], [located n])
       RoleAnnotD _ (RoleAnnotDecl _ n _) -> Just (Attached, [], [located n])
       WarningD _ d -> Just (Attached, [], namesIn modName d)
-      ForD _ d@ForeignImport{} -> Just (Value, [located $ fd_name d], [])
+      ForD _ d@ForeignImport{} -> Just (Value, [value . located $ fd_name d], [])
       ForD _ _ -> Just (Other, [], [])
       SpliceD{} -> Just (Splice, [], [])
       DefD{} -> Nothing
       DocD{} -> Nothing
       _ -> Just (Other, [], [])
+
+    value n = Item n (Just n) False Nothing False
+    unimportable n = Item n Nothing False Nothing False
 
     -- The class comes first, so that an instance joins its class when the
     -- module defines it and otherwise the first type in the head that the
@@ -137,14 +170,31 @@ declNodes modName = markOrphans . mapMaybe node . zip [0 ..]
         bound = Set.fromList $ concatMap nodeBinds ns
 
 -- | The names a type or class declaration binds: itself, its constructors
--- and fields, and for a class its methods and associated types.
-tyClBinders :: TyClDecl GhcPs -> [String]
-tyClBinders d = located (tyClDeclLName d) : conBinders d ++ methods
+-- and fields, and for a class its methods and associated types. All of them
+-- are imported through the type or class.
+tyClItems :: TyClDecl GhcPs -> [Item]
+tyClItems d = Item name entry True Nothing isNewtype : [Item c entry True (Just name) False | c <- conBinders d ++ methods]
   where
+    name = located $ tyClDeclLName d
+    entry
+      | all isNameChar name = Just name
+      | otherwise = Nothing
+    isNewtype = case d of
+      DataDecl{tcdDataDefn = HsDataDefn{dd_cons = NewTypeCon{}}} -> True
+      _ -> False
     methods = case d of
       ClassDecl{tcdSigs = sigs, tcdATs = ats} ->
         concatMap (sigSubjects . unLoc) sigs ++ map (located . fdLName . unLoc) ats
       _ -> []
+
+-- | A name as it is written in an import list.
+wrap :: String -> String
+wrap n
+  | all isNameChar n = n
+  | otherwise = "(" ++ n ++ ")"
+
+isNameChar :: Char -> Bool
+isNameChar c = isAlphaNum c || c == '_' || c == '\''
 
 -- | Constructor and field names anywhere inside a declaration.
 conBinders :: Data a => a -> [String]
@@ -175,7 +225,7 @@ sigSubjects = \case
 -- name in 'nodeWith', so its class in preference to its type. A signature
 -- or pragma joins all of them, since @f, g :: T@ belongs with both.
 declGroups :: [Node] -> [Group]
-declGroups ns = sortOn (Down . groupLines) $ map group components
+declGroups ns = sortOn (Down . groupLines) . orphanDeps $ map group components
   where
     binders :: Map String [Int]
     binders = Map.fromListWith (flip (++)) [(b, [nodeId n]) | n <- ns, b <- nodeBinds n]
@@ -189,8 +239,19 @@ declGroups ns = sortOn (Down . groupLines) $ map group components
     back :: Map Int [Int]
     back = Map.fromListWith (++) [(h, [nodeId n]) | n <- ns, h <- host n]
 
+    -- Orphan instances can use one another and nothing in the source says
+    -- so. They point at each other, which puts them all in one group.
+    orphans = [nodeId n | n <- ns, nodeOrphan n]
+
     graph =
-      [ (n, nodeId n, nub . filter (/= nodeId n) $ lookupAll (nodeUses n) ++ host n ++ Map.findWithDefault [] (nodeId n) back)
+      [ ( n
+        , nodeId n
+        , nub . filter (/= nodeId n) $
+            lookupAll (nodeUses n)
+              ++ host n
+              ++ Map.findWithDefault [] (nodeId n) back
+              ++ (if nodeOrphan n then orphans else [])
+        )
       | n <- ns
       ]
 
@@ -213,10 +274,32 @@ declGroups ns = sortOn (Down . groupLines) $ map group components
                   . filter (/= gid)
                   . mapMaybe (`Map.lookup` owner)
                   $ concatMap (\n -> Map.findWithDefault [] (nodeId n) edges) sorted
+            , groupOrphan = concat [nodeWith n | n <- sorted, nodeOrphan n]
             , groupNodes = sorted
             , groupLines = sum [nodeLastLine n - nodeFirstLine n + 1 | n <- sorted]
             , groupNames = nub $ concatMap nodeBinds sorted
             }
+
+-- | Make an orphan instance visible to the rest of the module.
+--
+-- In the original module every declaration can see an orphan instance. No
+-- name says which ones need it, so every group imports the orphan's group,
+-- except the groups the orphan itself depends on, which can't without a
+-- cycle. A module's orphans are all in one group, so there is one to add.
+orphanDeps :: [Group] -> [Group]
+orphanDeps gs = Map.elems $ foldl add (Map.fromList [(groupId g, g) | g <- gs]) orphans
+  where
+    orphans = [groupId g | g <- sortOn groupId gs, not . null $ groupOrphan g]
+    add m o =
+      let below = reach m Set.empty . groupDeps $ m Map.! o
+          see g
+            | groupId g == o || groupId g `Set.member` below = g
+            | otherwise = g{groupDeps = o : groupDeps g}
+       in Map.map see m
+    reach _ seen [] = seen
+    reach m seen (x : xs)
+      | x `Set.member` seen = reach m seen xs
+      | otherwise = reach m (Set.insert x seen) $ maybe [] groupDeps (Map.lookup x m) ++ xs
 
 -- | Every name mentioned in a piece of syntax that could refer to a
 -- top-level binder of this module: unqualified names, and names qualified
@@ -233,23 +316,29 @@ namesIn modName x = mapMaybe local (collect x :: [RdrName])
 -- could need.
 data Used = Used
   { usedNames :: Set.Set String
-  -- ^ Names written without a qualifier.
-  , usedQualifiers :: Set.Set String
-  -- ^ The qualifiers of names written with one.
+  -- ^ Every name, without its qualifier if it has one.
+  , usedUnqualified :: Set.Set String
+  -- ^ The names written without a qualifier.
+  , usedQualified :: Set.Set (String, String)
+  -- ^ The names written with a qualifier, as qualifier and name.
   }
 
 instance Semigroup Used where
-  Used a b <> Used c d = Used (a <> c) (b <> d)
+  Used a b c <> Used d e f = Used (a <> d) (b <> e) (c <> f)
 
 instance Monoid Used where
-  mempty = Used mempty mempty
+  mempty = Used mempty mempty mempty
+
+-- | The qualifiers that are written.
+usedQualifiers :: Used -> Set.Set String
+usedQualifiers = Set.map fst . usedQualified
 
 usedIn :: Data a => a -> Used
 usedIn x = foldMap use (collect x :: [RdrName])
   where
     use = \case
-      Unqual occ -> Used (Set.singleton $ occNameString occ) mempty
-      Qual m occ -> Used (Set.singleton $ occNameString occ) (Set.singleton $ moduleNameString m)
+      Unqual occ -> let n = occNameString occ in Used (Set.singleton n) (Set.singleton n) mempty
+      Qual m occ -> let n = occNameString occ in Used (Set.singleton n) mempty (Set.singleton (moduleNameString m, n))
       _ -> mempty
 
 located :: GenLocated l RdrName -> String

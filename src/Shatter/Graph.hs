@@ -145,7 +145,12 @@ declNodes modName = markOrphans . mapMaybe node . zip [0 ..]
 
     classify :: HsDecl GhcPs -> Maybe (Kind, [Item], [String])
     classify = \case
-      ValD _ bind@PatSynBind{} -> Just (Value, unimportable . rdr <$> collectHsBindBinders CollNoDictBinders bind, [])
+      ValD _ bind@(PatSynBind _ syn) ->
+        -- A record pattern synonym binds its fields as well.
+        let fields = case psb_args syn of
+              RecCon fs -> map rdr (collect fs :: [RdrName])
+              _ -> []
+         in Just (Value, map unimportable . nub $ map rdr (collectHsBindBinders CollNoDictBinders bind) ++ fields, [])
       ValD _ bind -> Just (Value, value . rdr <$> collectHsBindBinders CollNoDictBinders bind, [])
       TyClD _ d -> Just (TypeOrClass, tyClItems d, [])
       InstD _ (ClsInstD _ inst) -> Just (Instance, [], instanceHead $ cid_poly_ty inst)

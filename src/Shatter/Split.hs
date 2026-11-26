@@ -14,6 +14,7 @@ module Shatter.Split
 
 import Control.Exception (evaluate)
 import Control.Monad (forM, forM_, unless)
+import Data.Char (isUpper)
 import Data.List (intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub, sort, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
@@ -50,7 +51,9 @@ import Shatter.Graph
 import Shatter.Index
   ( Bound (..)
   , Entry (..)
+  , Exports (..)
   , Found (..)
+  , ImportList (..)
   , ImportSpec (..)
   , Info (..)
   , Package (..)
@@ -210,6 +213,20 @@ render index p =
 
     locals = Set.fromList $ concatMap nodeBinds (planNodes p)
 
+    -- The names an import can't be needed for when they are written
+    -- without a qualifier. A capitalised name can be a type or a
+    -- constructor, and the module shadows it only if it binds both: with
+    -- @data ConfVar = OS OS@, the second @OS@ is still the imported type.
+    shadowed = Set.filter (\x -> lower x || (x `Set.member` localTypes && x `Set.member` localValues)) locals
+      where
+        items = concatMap nodeItems (planNodes p)
+        isType i = itemType i && itemParent i == Nothing
+        localTypes = Set.fromList [itemName i | i <- items, isType i]
+        localValues = Set.fromList [itemName i | i <- items, not (isType i)]
+        lower = \case
+          c : _ -> not (isUpper c) && c /= ':'
+          [] -> True
+
     nameOf gid = fromMaybe (error "shatter: group without a name") . Map.lookup gid $ planNames p
 
     -- The orphan instances that the module could see through its imports.
@@ -226,7 +243,17 @@ render index p =
     -- replaced by imports of other modules' fragments.
     -- The export list can name things the declarations don't.
     wholeUsed = foldMap usedIn (parsedDecls parsed) <> foldMap usedIn (parsedExports parsed)
-    wholeImports = [importLines wholeUsed s d | (s, d) <- imports]
+    wholeImports =
+      [ if reexported d then (slice s, False, []) else importLines wholeUsed s d
+      | (s, d) <- imports
+      ]
+
+    -- An import the export list passes on with @module X@ brings in names
+    -- the module never writes, so it is kept as written.
+    reexported d =
+      any
+        (`Set.member` exportsModules (exportsOf modName $ parsedExports parsed))
+        [importQualifier $ importSpec d, importModule $ importSpec d]
     whole = case (index, parsedImportLines parsed) of
       (Just _, Just (first, final)) ->
         unlines $
@@ -271,7 +298,7 @@ render index p =
       Just pkg
         | Just (Known _) <- Map.lookup (importModule spec) (packageIndex pkg)
         , not (importSource spec) ->
-            case direct pkg locals used spec of
+            case direct pkg locals shadowed used spec of
               Just ls -> (ls, True, [])
               Nothing -> (asWritten, False, [importModule spec | importNeeded d used])
       _ -> (asWritten, False, [])
@@ -306,12 +333,12 @@ render index p =
 -- write; the import is then kept as it was.
 --
 -- A name written without a qualifier is only looked for when the module
--- doesn't bind it itself, and only when the import's own list lets it in.
+-- doesn't shadow it (the second set of names), and only when the import's own list lets it in.
 --
 -- Every newtype the import brings in is imported too, used or not:
 -- coercing through a newtype needs its constructor in scope.
-direct :: Package -> Set.Set String -> Used -> ImportSpec -> Maybe [String]
-direct pkg locals used spec
+direct :: Package -> Set.Set String -> Set.Set String -> Used -> ImportSpec -> Maybe [String]
+direct pkg locals shadowed used spec
   | any (foundUnsure . snd) founds = Nothing
   | otherwise = do
       entries <- traverse entry bounds
@@ -332,18 +359,26 @@ direct pkg locals used spec
     qualified = [x | (q, x) <- Set.toList $ usedQualified used, q == importQualifier spec]
     unqualified
       | importQualifiedOnly spec = []
-      | otherwise = filter (`Set.notMember` locals) . Set.toList $ usedUnqualified used
+      | otherwise = filter (`Set.notMember` shadowed) . Set.toList $ usedUnqualified used
     candidates = filter (allows $ importList spec) . nub $ qualified ++ unqualified
     founds = [(x, find pkg (importModule spec) x) | x <- candidates]
     bounds =
       nub $
-        [b | (x, f) <- founds, b <- foundBounds f, listed x b]
+        -- A binding with no way to import it has no type to be listed
+        -- under either, so it is kept: it makes the whole import stay.
+        [b | (x, f) <- founds, b <- foundBounds f, listed x b || boundHead b == Nothing]
           ++ [b | (x, b) <- newtypes pkg (importModule spec), allows (importList spec) x, listed x b, clear x]
     listed = picks $ importList spec
 
     -- Whether a name can come into scope without clashing with one the
-    -- module binds or one the import leaves out.
-    clear c = (importQualifiedOnly spec || c `Set.notMember` locals) && allows (importList spec) c
+    -- module binds or one the import leaves out. An import without a list
+    -- of names brought it in beside the module's own in the original, so
+    -- only a list (where @(..)@ on one type says nothing about another's
+    -- members) needs the check against the module's names.
+    clear c = (importQualifiedOnly spec || unlisted || c `Set.notMember` locals) && allows (importList spec) c
+    unlisted = case importList spec of
+      Only{} -> False
+      _ -> True
 
     -- A type is imported with everything that belongs to it, unless some
     -- of that would clash; then with the rest by name.

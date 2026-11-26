@@ -97,6 +97,8 @@ data Exports = Exports
   -- ^ The types and classes listed with @(..)@.
   , exportsModules :: Set String
   -- ^ The other modules, or import qualifiers, listed as @module M@.
+  , exportsWith :: Set (String, String)
+  -- ^ Each type or class with a name in parentheses after it.
   }
 
 data ImportList
@@ -140,13 +142,13 @@ wild item = case unLoc item of
   ie -> any (/= NoIEWildcard) (collect ie :: [IEWildcard])
 
 exportsOf :: String -> Maybe [LIE GhcPs] -> Exports
-exportsOf _ Nothing = Exports True mempty mempty mempty mempty
+exportsOf _ Nothing = Exports True mempty mempty mempty mempty mempty
 exportsOf self (Just items) = foldMap one items
   where
     one item = case unLoc item of
       IEModuleContents _ m
-        | moduleNameString (unLoc m) == self -> Exports True mempty mempty mempty mempty
-        | otherwise -> Exports False mempty mempty mempty . Set.singleton . moduleNameString $ unLoc m
+        | moduleNameString (unLoc m) == self -> Exports True mempty mempty mempty mempty mempty
+        | otherwise -> Exports False mempty mempty mempty (Set.singleton . moduleNameString $ unLoc m) mempty
       ie
         | named ie ->
             let names = map rdr (collect ie :: [RdrName])
@@ -157,6 +159,7 @@ exportsOf self (Just items) = foldMap one items
                   (Set.fromList $ delete self' names)
                   (if wild item then Set.singleton self' else mempty)
                   mempty
+                  (Set.fromList [(self', m) | m <- delete self' names])
         | otherwise -> mempty
     named = \case
       IEVar{} -> True
@@ -166,10 +169,10 @@ exportsOf self (Just items) = foldMap one items
       _ -> False
 
 instance Semigroup Exports where
-  Exports a b c d e <> Exports f g h i j = Exports (a || f) (b <> g) (c <> h) (d <> i) (e <> j)
+  Exports a b c d e k <> Exports f g h i j l = Exports (a || f) (b <> g) (c <> h) (d <> i) (e <> j) (k <> l)
 
 instance Monoid Exports where
-  mempty = Exports False mempty mempty mempty mempty
+  mempty = Exports False mempty mempty mempty mempty mempty
 
 -- | Whether an import could bring a name into scope, going by its list.
 allows :: ImportList -> String -> Bool
@@ -283,11 +286,27 @@ environment envs ix (Known info) = Env bound outside
     ex = infoExports info
     binders = infoBinders info
 
-    local = Map.filter (not . null) $ Map.mapWithKey (filter . exported) binders
+    local = Map.mapWithKey bundle . Map.filter (not . null) $ Map.mapWithKey (filter . exported) binders
     exported x b =
       exportsLocal ex
         || x `Set.member` exportsNames ex
         || maybe False (`Set.member` exportsWild ex) (boundParent b)
+
+    -- An export list can attach a pattern synonym and its fields to a type
+    -- of the module, as in @T (P, field, ..)@. Importing the module's @T (..)@
+    -- then brings them in, but importing @T (..)@ from the fragment that
+    -- binds @T@ would not. Such a type is marked as one this program can't
+    -- write an import for, so imports that mention it are kept as written.
+    bundle x bs
+      | x `Set.member` bundling = [b{boundHead = Nothing} | b <- bs]
+      | otherwise = bs
+    bundling =
+      Set.fromList
+        [ t
+        | (t, m) <- Set.toList $ exportsWith ex
+        , t `Map.member` binders
+        , not . any ((== Just t) . boundParent) $ Map.findWithDefault [] m binders
+        ]
 
     byModule i = any (`Set.member` exportsModules ex) [importQualifier i, importModule i]
     home i = importModule i `Map.member` ix

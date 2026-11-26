@@ -109,6 +109,9 @@ cabal run cabal-shatter -- --split --direct --out SOURCE-DIR FILE ...
 
 - The splitter works out what each module exports from its export list and imports, following re-exports inside the package.
 - An import is kept as written when a name the fragment uses might come from outside the package, for example through a module that re-exports an external one.
+- An import is also kept as written when it brings in a pattern synonym, or a type whose export attaches a pattern synonym to it, as in `T (P, field, ..)`. Importing `T (..)` from the fragment that binds `T` would leave those out.
+- In a module left whole, an import that the export list passes on with `module X` is kept as written.
+- A capitalised name the module binds only as a constructor can still be an imported type, as in `data ConfVar = OS OS`, so it is still looked for.
 - A type is imported with everything that belongs to it, less whatever the original import hid or the module binds itself.
 - Every newtype the original import brought in is imported, used or not, because coercing through a newtype needs its constructor in scope.
 - Every fragment imports, with an empty list, the orphan fragments its module could reach, and any reachable module that couldn't be split and declares instances.

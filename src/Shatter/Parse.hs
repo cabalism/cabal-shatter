@@ -2,13 +2,17 @@
 -- typechecking it.
 module Shatter.Parse
   ( Parsed (..)
+  , Cpp (..)
   , parseFile
   , lineSpan
   ) where
 
 import Control.Monad.IO.Class (liftIO)
 import Data.Char (isSpace, toLower)
-import Data.List (isInfixOf, isPrefixOf)
+import Control.Exception (evaluate)
+import Data.Char (isDigit)
+import Data.List (intercalate, isInfixOf, isPrefixOf, unsnoc)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust, mapMaybe)
 import GHC
   ( GhcPs
@@ -32,7 +36,10 @@ import GHC.Parser (parseModule)
 import GHC.Parser.Lexer (P (unP), ParseResult (..), initParserState)
 import GHC.Types.SrcLoc (SrcSpan (..), mkRealSrcLoc, srcSpanEndLine, srcSpanStartLine)
 import GHC.Settings.Config (cProjectVersion)
-import System.Process (readProcess)
+import System.Directory (getTemporaryDirectory, removeFile)
+import System.Exit (ExitCode (..))
+import System.IO (hClose, openTempFile)
+import System.Process (readProcess, readProcessWithExitCode)
 
 -- | What the splitter needs from a parsed module.
 data Parsed = Parsed
@@ -56,6 +63,15 @@ data Parsed = Parsed
   -- ^ The first and last lines of the imports.
   }
 
+-- | What the C preprocessor needs for a module that uses CPP.
+data Cpp = Cpp
+  { cppMacros :: [FilePath]
+  -- ^ Header files to include first, such as cabal's @cabal_macros.h@.
+  , cppFlags :: [String]
+  -- ^ @-D@ and @-I@ options, as the package's @cpp-options@ and
+  -- @include-dirs@ give them.
+  }
+
 -- | Parse a file. The extra flags are passed to GHC as if on the command
 -- line, for extensions that the package turns on outside the file, such as
 -- @-XHaskell2010@.
@@ -63,19 +79,25 @@ data Parsed = Parsed
 -- The GHC library needs the compiler's library directory, so this runs
 -- @ghc --print-libdir@ with the given compiler, or with the compiler this
 -- program was built against when none is given.
-parseFile :: Maybe FilePath -> [String] -> FilePath -> IO (Either String Parsed)
-parseFile withGhc extraFlags path = do
-  src <- readFile path
-  let pragmas = languagePragmas src
-  if any ((== "cpp") . map toLower) pragmas
-    then pure . Left $ path ++ ": uses CPP, which the splitter does not handle"
-    else do
-      let ghc = maybe ("ghc-" ++ cProjectVersion) id withGhc
+--
+-- A module that uses CPP is preprocessed first, and what is parsed and
+-- split is the preprocessor's output: the text GHC would have compiled
+-- with these macros, with each line still on the line it came from.
+parseFile :: Maybe FilePath -> Cpp -> [String] -> FilePath -> IO (Either String Parsed)
+parseFile withGhc cpp extraFlags path = do
+  original <- readFile path
+  let ghc = maybe ("ghc-" ++ cProjectVersion) id withGhc
+      usesCpp = any ((== "cpp") . map toLower) (languagePragmas original) || "-XCPP" `elem` extraFlags
+  preprocessed <- if usesCpp then preprocess ghc cpp path else pure $ Right original
+  case preprocessed of
+    Left err -> pure $ Left err
+    Right src -> do
+      let pragmas = languagePragmas src
       libdir <- trim <$> readProcess ghc ["--print-libdir"] ""
       runGhc (Just libdir) $ do
         dflags0 <- getSessionDynFlags
         logger <- getLogger
-        let flags = map noLoc $ extraFlags ++ map ("-X" ++) pragmas
+        let flags = map noLoc $ filter (/= "-XCPP") extraFlags ++ map ("-X" ++) pragmas
         (dflags, _, _) <- parseDynamicFlags logger dflags0 flags
         let buf = stringToStringBuffer src
             loc = mkRealSrcLoc (mkFastString path) 1 1
@@ -98,6 +120,69 @@ parseFile withGhc extraFlags path = do
                         [] -> Nothing
                         spans -> Just (minimum $ map fst spans, maximum $ map snd spans)
                     }
+
+-- | Run GHC's preprocessing phase on a file and give back its text with
+-- CPP turned off.
+preprocess :: FilePath -> Cpp -> FilePath -> IO (Either String String)
+preprocess ghc cpp path = do
+  tmp <- getTemporaryDirectory
+  (out, h) <- openTempFile tmp "shatter.hspp"
+  hClose h
+  -- Without -hide-all-packages GHC defines version macros for the
+  -- packages it can see, which are not the ones the package is built with.
+  let args =
+        ["-E", "-cpp", "-v0", "-hide-all-packages", path, "-o", out]
+          ++ concat [["-optP-include", "-optP" ++ m] | m <- cppMacros cpp]
+          ++ cppFlags cpp
+  (code, _, err) <- readProcessWithExitCode ghc args ""
+  text <- readFile out
+  _ <- evaluate $ length text
+  removeFile out
+  pure $ case code of
+    ExitSuccess -> Right . unlines . map withoutCpp . realign path $ lines text
+    ExitFailure _ -> Left $ path ++ ": the preprocessor failed\n" ++ err
+
+-- | Put each line of the preprocessor's output back on the line of the
+-- file it came from, going by the line markers, and drop the markers and
+-- the lines that came from other files.
+realign :: FilePath -> [String] -> [String]
+realign path = fill 1 . Map.toAscList . go Nothing Map.empty
+  where
+    go _ acc [] = acc
+    go at acc (l : ls) = case marker l of
+      Just (n, file) -> go (if file == path then Just n else Nothing) acc ls
+      Nothing -> case at of
+        Just n -> go (Just $ n + 1) (Map.insert n l acc) ls
+        Nothing -> go Nothing acc ls
+
+    fill _ [] = []
+    fill n rest@((m, l) : more)
+      | n < m = "" : fill (n + 1) rest
+      | otherwise = l : fill (n + 1) more
+
+    -- @# 12 "File.hs"@ from the preprocessor, or the @LINE@ pragma GHC
+    -- puts on the first line.
+    marker :: String -> Maybe (Int, FilePath)
+    marker l = case words l of
+      "#" : n : file : _ | all isDigit n, Just f <- quoted file -> Just (read n, f)
+      "{-#" : "LINE" : n : file : _ | all isDigit n, Just f <- quoted file -> Just (read n, f)
+      _ -> Nothing
+    quoted = \case
+      '"' : rest | Just (f, '"') <- unsnoc rest -> Just f
+      _ -> Nothing
+
+-- | Take CPP out of a one-line @LANGUAGE@ pragma, leaving the line in place.
+withoutCpp :: String -> String
+withoutCpp l
+  | "{-# language" `isPrefixOf` map toLower l
+  , names <- languagePragmas l
+  , any isCpp names =
+      case filter (not . isCpp) names of
+        [] -> ""
+        rest -> "{-# LANGUAGE " ++ intercalate ", " rest ++ " #-}"
+  | otherwise = l
+  where
+    isCpp = (== "cpp") . map toLower
 
 -- | The first and last lines of a source span.
 lineSpan :: SrcSpan -> Maybe (Int, Int)

@@ -16,7 +16,8 @@ Options:
 
 - `--top N` lists the N largest groups (default 10); `--all` lists every group.
 - `-XEXTENSION` passes an extension to the parser, for extensions the package turns on outside the file.
-- `--with-ghc GHC` names the compiler to ask for the library directory. The default is the compiler the program was built with.
+- `--with-ghc GHC` names the compiler to ask for the library directory and to preprocess modules that use CPP. The default is the compiler the program was built with.
+- `--macros HEADER` names a header to include when preprocessing, such as the `cabal_macros.h` that cabal writes under `build/autogen`. `-DMACRO` and `-IDIR` pass the package's `cpp-options` and `include-dirs`.
 
 With the executable on the `PATH`, `cabal shatter --report FILE` works too.
 
@@ -120,7 +121,7 @@ The run ends with how many imports were replaced and which modules' imports were
 
 ## Limits
 
-- Modules that use CPP are refused.
+- A module that uses CPP is preprocessed with GHC (`ghc -E`) and it is the output that is split. Every line stays on the line it came from, so the map file still points at the original. The fragments, and the module itself if it stays whole, hold the text for one set of macros: re-split after a change to the package's flags, dependencies or compiler.
 - Modules with top-level Template Haskell splices or an hs-boot file are reported but not split.
 - With `--direct`, an orphan instance that reaches a fragment only through a module outside the package can be lost, and so can the constructor of an external newtype.
 - A module that uses `RebindableSyntax` may lose an import it needs, because the names that syntax refers to are not written in the source.

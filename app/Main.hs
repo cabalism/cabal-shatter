@@ -8,7 +8,7 @@ import Data.Maybe (mapMaybe)
 import Data.Ord (Down (..))
 import Shatter.Costs (readCosts, showCosts, timingsUnder)
 import Shatter.Index (Package, package, textualEntry)
-import Shatter.Parse (parseFile)
+import Shatter.Parse (Cpp (..), parseFile)
 import Shatter.Report (report)
 import Shatter.Split
   ( Fragment (..)
@@ -36,14 +36,19 @@ data Options = Options
   , optTop :: Maybe Int
   , optWithGhc :: Maybe FilePath
   , optGhcFlags :: [String]
+  , optMacros :: [FilePath]
+  , optCppFlags :: [String]
   , optFiles :: [FilePath]
   }
+
+optCpp :: Options -> Cpp
+optCpp opts = Cpp (reverse $ optMacros opts) (reverse $ optCppFlags opts)
 
 main :: IO ()
 main = do
   -- When run as @cabal shatter@, cabal passes the command name first.
   args <- dropWhile (== "shatter") <$> getArgs
-  case parse (Options Report False 0 Nothing (Just 10) Nothing [] []) args of
+  case parse (Options Report False 0 Nothing (Just 10) Nothing [] [] [] []) args of
     Left err -> die $ err ++ "\n" ++ usage
     Right opts
       | Timings dir <- optMode opts -> putStr . showCosts =<< timingsUnder dir
@@ -54,7 +59,7 @@ run :: Options -> IO ()
 run opts@Options{optMode = Report} = do
   -- The report needs only a module that parses, not one that can be split.
   costs <- maybe (pure mempty) readCosts $ optCosts opts
-  results <- mapM (parseFile (optWithGhc opts) (reverse $ optGhcFlags opts)) . reverse $ optFiles opts
+  results <- mapM (parseFile (optWithGhc opts) (optCpp opts) (reverse $ optGhcFlags opts)) . reverse $ optFiles opts
   let (failed, parsed) = partitionEithers results
   mapM_ (hPutStrLn stderr) failed
   mapM_ (putStrLn . report (optTop opts) (optPack opts) costs) parsed
@@ -67,7 +72,7 @@ run opts = do
     result <-
       if hasBoot
         then pure . Left $ file ++ ": has an hs-boot file, which the splitter does not handle"
-        else parseFile (optWithGhc opts) (reverse $ optGhcFlags opts) file
+        else parseFile (optWithGhc opts) (optCpp opts) (reverse $ optGhcFlags opts) file
     pure . either (Left . (,) file) Right $ plan (optPack opts) costs =<< result
   let (whole, plans) = partitionEithers attempts
   mapM_ (hPutStrLn stderr . snd) whole
@@ -135,7 +140,9 @@ parse opts = \case
     | Just k <- readMaybe n -> parse opts{optTop = Just k} rest
     | otherwise -> Left $ "--top needs a number, not " ++ n
   "--with-ghc" : ghc : rest -> parse opts{optWithGhc = Just ghc} rest
+  "--macros" : file : rest -> parse opts{optMacros = file : optMacros opts} rest
   flag : rest
+    | "-D" `isPrefixOf` flag || "-I" `isPrefixOf` flag -> parse opts{optCppFlags = flag : optCppFlags opts} rest
     | "-X" `isPrefixOf` flag -> parse opts{optGhcFlags = flag : optGhcFlags opts} rest
     | "-" `isPrefixOf` flag -> Left $ "unknown option " ++ flag
   file : rest -> parse opts{optFiles = file : optFiles opts} rest
@@ -160,5 +167,5 @@ usage =
     , "--timings DIR   print the compile time of each module from the .dump-timings files"
     , "                under DIR, for --costs; the build has to be serial and unpacked"
     , ""
-    , "GHC is any of: --with-ghc GHC, -XEXTENSION"
+    , "GHC is any of: --with-ghc GHC, -XEXTENSION, --macros HEADER, -DMACRO, -IDIR"
     ]

@@ -333,7 +333,10 @@ environment envs ix (Known info) = Env bound outside
             )
             (envBound env)
 
-    reexported = Map.unionsWith (++) $ map through (filter home followed)
+    -- A qualified import puts no unqualified name in scope, so a name in
+    -- the export list can't mean one of its. A name exported with its
+    -- qualifier is then not found here and counts as possibly from outside.
+    reexported = Map.unionsWith (++) $ map through (filter (\i -> home i && not (importQualifiedOnly i)) followed)
     bound = Map.unionWith (++) local $ Map.filterWithKey (\x _ -> x `Map.notMember` binders) reexported
 
     -- A type listed with (..) that isn't found in the package comes from

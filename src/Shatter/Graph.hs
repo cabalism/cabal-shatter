@@ -13,6 +13,9 @@ module Shatter.Graph
   , Group (..)
   , declNodes
   , declGroups
+  , Used (..)
+  , usedIn
+  , collect
   ) where
 
 import Data.Data (Data, gmapQ)
@@ -222,6 +225,29 @@ namesIn modName x = mapMaybe local (collect x :: [RdrName])
       Unqual occ -> Just $ occNameString occ
       Qual m occ | moduleNameString m == modName -> Just $ occNameString occ
       _ -> Nothing
+
+-- | The names a piece of syntax mentions, for deciding which imports it
+-- could need.
+data Used = Used
+  { usedNames :: Set.Set String
+  -- ^ Names written without a qualifier.
+  , usedQualifiers :: Set.Set String
+  -- ^ The qualifiers of names written with one.
+  }
+
+instance Semigroup Used where
+  Used a b <> Used c d = Used (a <> c) (b <> d)
+
+instance Monoid Used where
+  mempty = Used mempty mempty
+
+usedIn :: Data a => a -> Used
+usedIn x = foldMap use (collect x :: [RdrName])
+  where
+    use = \case
+      Unqual occ -> Used (Set.singleton $ occNameString occ) mempty
+      Qual m occ -> Used (Set.singleton $ occNameString occ) (Set.singleton $ moduleNameString m)
+      _ -> mempty
 
 located :: GenLocated l RdrName -> String
 located = rdr . unLoc

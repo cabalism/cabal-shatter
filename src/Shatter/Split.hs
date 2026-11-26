@@ -11,12 +11,25 @@ module Shatter.Split
 import Control.Exception (evaluate)
 import Control.Monad (forM, forM_, unless)
 import Data.Char (isAlphaNum, ord)
-import Data.List (intercalate, isPrefixOf, isSuffixOf, sort, sortOn)
+import Data.List (intercalate, isInfixOf, isPrefixOf, isSuffixOf, sort, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
-import GHC (GhcPs, HsDecl (..), LHsDecl, getLocA, unLoc)
+import Data.Set qualified as Set
+import GHC
+  ( GhcPs
+  , HsDecl (..)
+  , IE (..)
+  , IEWildcard (..)
+  , ImportDecl (..)
+  , ImportDeclQualifiedStyle (..)
+  , ImportListInterpretation (..)
+  , LHsDecl
+  , getLocA
+  , moduleNameString
+  , unLoc
+  )
 import Numeric (showHex)
-import Shatter.Graph (Group (..), Kind (..), Node (..), declGroups, declNodes)
+import Shatter.Graph (Group (..), Kind (..), Node (..), Used (..), collect, declGroups, declNodes, usedIn)
 import Shatter.Parse (Parsed (..), lineSpan)
 import System.Directory
   ( createDirectoryIfMissing
@@ -49,9 +62,9 @@ split parsed
   | not (null splices) = refuse $ "has top-level splices at lines " ++ linesOf splices
   | not (null orphans) = refuse $ "has orphan instances at lines " ++ linesOf orphans
   | otherwise = do
-      (headerEnd, importBlock) <- header
+      headerEnd <- header
       let slices = declSlices headerEnd (parsedDecls parsed)
-          fragments = map (fragment importBlock slices) groups
+          fragments = map (fragment slices) groups
       pure
         Split
           { splitModule = modName
@@ -70,27 +83,34 @@ split parsed
 
     slice (first, final) = take (final - first + 1) $ drop (first - 1) src
 
-    -- Lines above the module's name: pragmas and the header comment.
-    preamble = maybe [] (\n -> take (n - 1) src) $ parsedNameLine parsed
+    -- The pragmas above the module's name. The header comment is left
+    -- behind, so that editing it doesn't change every fragment.
+    pragmas = pragmaLines . maybe [] (\n -> take (n - 1) src) $ parsedNameLine parsed
 
-    -- The last line of the header and imports, and the imports' text.
+    -- The last line of the header and imports.
     header = case (parsedImportLines parsed, parsedNameLine parsed) of
-      (Just (first, final), _) -> Right (final, slice (first, final))
+      (Just (_, final), _) -> Right final
       (Nothing, Just n) ->
         case [i | (i, l) <- drop (n - 1) $ zip [1 ..] src, "where" `isSuffixOf` unwords (words l)] of
-          i : _ -> Right (i, [])
+          i : _ -> Right i
           [] -> refuse "has a header whose end can't be found"
-      (Nothing, Nothing) -> Right (0, [])
+      (Nothing, Nothing) -> Right 0
+
+    imports = [(s, importNeeded $ unLoc i) | i <- parsedImports parsed, Just s <- [lineSpan $ getLocA i]]
+
+    decls = Map.fromList . zip [0 :: Int ..] $ parsedDecls parsed
 
     names :: Map.Map Int String
     names = fragmentNames modName groups
 
     nameOf gid = fromMaybe (error "shatter: group without a name") $ Map.lookup gid names
 
-    fragment importBlock slices g =
+    fragment slices g =
       let own = [(nodeId n, s) | n <- groupNodes g, Just s <- [Map.lookup (nodeId n) slices]]
+          used = foldMap usedIn [d | n <- groupNodes g, Just d <- [Map.lookup (nodeId n) decls]]
+          importBlock = concat [slice s | (s, needed) <- imports, needed used]
           top =
-            preamble
+            pragmas
               ++ [ "{-# OPTIONS_GHC -Wno-unused-imports -Wno-unused-top-binds -Wno-missing-export-lists #-}"
                  , "module " ++ nameOf (groupId g) ++ " where"
                  , ""
@@ -121,11 +141,43 @@ split parsed
     -- With no export list the original exported everything it defined, so
     -- the facade re-exports every fragment.
     generatedHeader fragmentModules =
-      preamble
+      pragmas
         ++ ["module " ++ modName]
         ++ zipWith (\sep m -> "  " ++ sep ++ " module " ++ m) ("(" : repeat ",") fragmentModules
         ++ ["  ) where", ""]
         ++ maybe [] slice (parsedImportLines parsed)
+
+-- | Whether a fragment that mentions the given names could need an import.
+--
+-- Only two kinds of import can be ruled out without knowing what a module
+-- exports: a qualified import whose qualifier is never written, and an
+-- import with a list of names none of which is written. An import that
+-- brings in everything, hides names, lists a type with @(..)@, or lists
+-- nothing (for its instances) is always kept.
+importNeeded :: ImportDecl GhcPs -> Used -> Bool
+importNeeded d used
+  | qualifier `Set.member` usedQualifiers used = True
+  | ideclQualified d /= NotQualified = False
+  | otherwise = case ideclImportList d of
+      Just (Exactly, items)
+        | null (unLoc items) || wildcard items -> True
+        | otherwise -> any (`Set.member` usedNames used) . Set.toList . usedNames $ usedIn items
+      _ -> True
+  where
+    qualifier = moduleNameString . unLoc . fromMaybe (ideclName d) $ ideclAs d
+    wildcard items =
+      any (\case IEThingAll{} -> True; _ -> False) (unLoc <$> unLoc items)
+        || any (/= NoIEWildcard) (collect items :: [IEWildcard])
+
+-- | The lines of the @{-\# ... \#-}@ pragmas in a module's preamble.
+pragmaLines :: [String] -> [String]
+pragmaLines = go False
+  where
+    go _ [] = []
+    go inside (l : ls)
+      | inside = l : go (not $ "#-}" `isInfixOf` l) ls
+      | "{-#" `isPrefixOf` dropWhile (== ' ') l = l : go (not $ "#-}" `isInfixOf` l) ls
+      | otherwise = go False ls
 
 -- | The lines each declaration owns: from the line after the previous
 -- declaration to its own last line, so that the comments above a

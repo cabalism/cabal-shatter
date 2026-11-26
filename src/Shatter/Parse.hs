@@ -14,6 +14,7 @@ import GHC
   ( GhcPs
   , HsModule (..)
   , LHsDecl
+  , LImportDecl
   , getLocA
   , getSessionDynFlags
   , moduleNameString
@@ -40,6 +41,8 @@ data Parsed = Parsed
   -- ^ The top-level declarations, in source order.
   , parsedLines :: Int
   -- ^ The number of lines in the file.
+  , parsedImports :: [LImportDecl GhcPs]
+  -- ^ The imports, in source order.
   , parsedSource :: [String]
   -- ^ The file's lines.
   , parsedNameLine :: Maybe Int
@@ -83,6 +86,7 @@ parseFile withGhc extraFlags path = do
                     { parsedName = maybe "Main" (moduleNameString . unLoc) $ hsmodName m
                     , parsedDecls = hsmodDecls m
                     , parsedLines = length $ lines src
+                    , parsedImports = hsmodImports m
                     , parsedSource = lines src
                     , parsedNameLine = fst <$> (lineSpan . getLocA =<< hsmodName m)
                     , parsedHasExports = isJust $ hsmodExports m

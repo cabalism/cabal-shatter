@@ -30,7 +30,7 @@ cabal run cabal-shatter -- --list-modules FILE ...
 For module `Foo.Bar` this writes, under `SOURCE-DIR`:
 
 - `Foo/Bar.hs`, a facade with the original header, export list and imports, importing every fragment.
-- `Foo/Bar/S_<name>.hs`, one fragment per group, named after the least name the group binds. Each has the original pragmas and imports, imports the fragments it depends on, and exports everything.
+- `Foo/Bar/S_<name>.hs`, one fragment per group, named after the least name the group binds. Each has the original pragmas, the imports it could need, and imports of the fragments it depends on. It exports everything.
 - `Foo/Bar.shatter-map`, which lists for each fragment the lines copied from the original: fragment module, fragment line, original line, line count.
 
 A file whose content hasn't changed is not rewritten, so after an edit only one fragment changes. `--list-modules` prints the fragment module names to add to the package's module list.
@@ -57,9 +57,21 @@ The analysis is syntactic; nothing is renamed or typechecked.
 - An instance joins its class when the module defines it, and otherwise the first type in its head that the module defines. An instance with neither is reported as an orphan.
 - Mutually dependent declarations form one group.
 
+## Which imports a fragment keeps
+
+Without knowing what a module exports, only two kinds of import can be ruled out:
+
+- a qualified import whose qualifier the fragment never writes;
+- an import with a list of names, none of which the fragment writes.
+
+An import that brings in everything, hides names, lists a type with `(..)`, or lists nothing (for its instances) is kept in every fragment. Adding or changing one of those rewrites every fragment, so GHC recompiles them all.
+
+The module's header comment is not copied, so editing it changes only the facade.
+
 ## Limits
 
 - Modules that use CPP are refused.
 - Modules with top-level Template Haskell splices or orphan instances are reported but not split.
+- A module that uses `RebindableSyntax` may lose an import it needs, because the names that syntax refers to are not written in the source.
 - Whole-module warnings for unused imports and unused top-level bindings are turned off in the fragments.
 - The `ghc` library ties the build to one compiler version, GHC 10.0 at present.

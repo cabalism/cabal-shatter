@@ -29,6 +29,7 @@ library
     Shatter.Costs
     Shatter.Graph
     Shatter.Index
+    Shatter.Locate
     Shatter.Parse
     Shatter.Report
     Shatter.Shadow

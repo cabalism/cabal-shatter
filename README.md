@@ -48,6 +48,18 @@ Run from the project's directory, or name it with `--root`. This makes `OUT-DIR`
 
 After an edit to the original, run the command again and build. Only the files whose content changed are rewritten. A module deleted from the original leaves its files behind in the shadow.
 
+To see errors and warnings against the original files, pass the build's output through `--locate`:
+
+```
+cabal build --project-dir OUT-DIR 2>&1 | cabal-shatter --locate OUT-DIR
+```
+
+- A location in a file of the shadow becomes the file and line in the project that the line was copied from. Line spans, the locations inside a message, the line numbers beside the source excerpt and `(line N)` hints are rewritten too. Columns don't change.
+- Paths are shown relative to the current directory where they are beneath it.
+- A fragment's module name becomes the name of the module it was split from.
+- A location on a line the splitter wrote, such as a fragment's imports, is left as it is, since it has no place in the original.
+- GHC's suggestions can differ from an unsplit build's: a misspelt name is not matched against names in other fragments that the fragment doesn't import.
+
 A run after the first reads only what changed:
 
 - Each library's last run is remembered in `OUT-DIR/.shatter-cache`: a hash of every module's source and what the rest of the package was told about the module (the names it binds and exports, its imports, and which fragment holds each name).
@@ -82,7 +94,7 @@ For module `Foo.Bar` this writes, under `SOURCE-DIR`:
 
 - `Foo/Bar.hs`, a facade with the original header, export list and imports, importing every fragment.
 - `Foo/Bar/S_<name>.hs`, one fragment per group, named after the least name the group binds. Each has the original pragmas, the imports it could need, and imports of the fragments it depends on. It exports everything.
-- `Foo/Bar.shatter-map`, which lists for each fragment the lines copied from the original: fragment module, fragment line, original line, line count.
+- `Foo/Bar.shatter-map`, which names the module on its first line and then lists the runs of lines copied from the original: the module they are in now (a fragment, or `Foo.Bar` itself), its line, the original's line, and the line count.
 
 A file whose content hasn't changed is not rewritten, so after an edit only one fragment changes. `--list-modules` prints the fragment module names to add to the package's module list.
 

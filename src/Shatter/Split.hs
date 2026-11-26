@@ -89,6 +89,9 @@ data Split = Split
   { splitModule :: String
   , splitFacade :: String
   , splitFragments :: [Fragment]
+  , splitSlices :: [(Int, Int, Int)]
+  -- ^ As 'fragmentSlices', for the lines of the original that are still
+  -- in the module of the original's name.
   , splitDirect :: Int
   -- ^ How many imports of other modules in the package were replaced by
   -- imports of their fragments.
@@ -182,6 +185,7 @@ render index p =
         { splitModule = modName
         , splitFacade = whole
         , splitFragments = []
+        , splitSlices = wholeSlices
         , splitDirect = length [() | (_, True, _) <- wholeImports]
         , splitKept = concat [k | (_, _, k) <- wholeImports]
         }
@@ -190,6 +194,7 @@ render index p =
         { splitModule = modName
         , splitFacade = facade
         , splitFragments = [f | (f, _, _) <- rendered]
+        , splitSlices = [(2, 1, planHeaderEnd p) | parsedHasExports parsed]
         , splitDirect = sum [n | (_, n, _) <- rendered]
         , splitKept = concat [k | (_, _, k) <- rendered]
         }
@@ -259,10 +264,19 @@ render index p =
         unlines $
           ["{-# OPTIONS_GHC -Wno-unused-imports -Wno-dodgy-imports #-}"]
             ++ take (first - 1) src
-            ++ concat [ls | (ls, _, _) <- wholeImports]
-            ++ orphans
+            ++ wholeImported
             ++ drop final src
       _ -> unlines src
+    wholeImported = concat [ls | (ls, _, _) <- wholeImports] ++ orphans
+
+    -- The lines before the imports move down one, and the lines after
+    -- them by however many lines the imports gained.
+    wholeSlices = case (index, parsedImportLines parsed) of
+      (Just _, Just (first, final)) ->
+        [ (2, 1, first - 1)
+        , (first + length wholeImported + 1, final + 1, length src - final)
+        ]
+      _ -> [(1, 1, length src)]
 
     fragment g =
       let own = [(nodeId n, s) | n <- groupNodes g, Just s <- [Map.lookup (nodeId n) slices]]
@@ -280,7 +294,7 @@ render index p =
               ++ [sibling $ nameOf d | d <- sort . nub $ groupDeps g]
           place (line, acc, text) (_, s@(first, final)) =
             let body = slice s
-             in (line + length body + 1, (line + 1, first, final - first + 1) : acc, text ++ [""] ++ body)
+             in (line + length body + 1, (line + 2, first, final - first + 1) : acc, text ++ [""] ++ body)
           (_, placed, textLines) = foldl place (length top, [], top) own
        in ( Fragment
               { fragmentModule = nameOf (groupId g)
@@ -483,11 +497,13 @@ writeSplit root s = do
       }
   where
     sliceMap =
-      unlines
-        [ unwords [fragmentModule f, show line, show orig, show count]
-        | f <- splitFragments s
-        , (line, orig, count) <- fragmentSlices f
-        ]
+      unlines $
+        unwords ["module", splitModule s]
+          : [ unwords [m, show line, show orig, show count]
+            | (m, slices) <- (splitModule s, splitSlices s) : [(fragmentModule f, fragmentSlices f) | f <- splitFragments s]
+            , (line, orig, count) <- slices
+            , count > 0
+            ]
     readFileStrict path = do
       text <- readFile path
       _ <- evaluate $ length text

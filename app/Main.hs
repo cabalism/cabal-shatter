@@ -13,6 +13,7 @@ import Shatter.Advise (Advice (..), Piece (..), Unit (..), advise, importsOf, sh
 import Shatter.Cache (Cache (..), Cached (..), readCache, stampFile, stampOf, writeCache)
 import Shatter.Costs (readCosts, showCosts, timingsUnder)
 import Shatter.Index (Entry (..), ImportSpec (..), Info (..), Package, package, textualEntry)
+import Shatter.Locate (loadPlaces, relocate)
 import Shatter.Parse (Cpp (..), parseFile)
 import Shatter.Report (report)
 import Shatter.Shadow (Library (..), findMacros, ghcVersion, mirror, readLibrary, withFragments)
@@ -28,14 +29,14 @@ import Shatter.Split
   , render
   , writeSplit
   )
-import System.Directory (canonicalizePath, createDirectoryIfMissing, doesFileExist, getFileSize, getModificationTime)
+import System.Directory (canonicalizePath, createDirectoryIfMissing, doesFileExist, getCurrentDirectory, getFileSize, getModificationTime)
 import System.FilePath (makeRelative, takeDirectory, (<.>), (</>))
 import System.Environment (getArgs, getExecutablePath)
 import System.Exit (die, exitFailure)
-import System.IO (hPutStr, hPutStrLn, stderr)
+import System.IO (BufferMode (..), hPutStr, hPutStrLn, hSetBuffering, stderr, stdout)
 import Text.Read (readMaybe)
 
-data Mode = Report | SplitTo FilePath | ListModules | Timings FilePath | Shadow FilePath | Advise
+data Mode = Report | SplitTo FilePath | ListModules | Timings FilePath | Shadow FilePath | Advise | Locate FilePath
 
 data Options = Options
   { optMode :: Mode
@@ -66,6 +67,7 @@ main = do
     Left err -> die $ err ++ "\n" ++ usage
     Right opts
       | Timings dir <- optMode opts -> putStr . showCosts =<< timingsUnder dir
+      | Locate dir <- optMode opts -> locate dir
       | null (optFiles opts) -> die usage
       | otherwise -> run opts
 
@@ -97,6 +99,7 @@ run opts = do
     Timings _ -> pure ()
     Shadow _ -> pure ()
     Advise -> pure ()
+    Locate _ -> pure ()
     ListModules -> mapM_ (mapM_ (putStrLn . fragmentModule) . splitFragments . render Nothing) plans
     SplitTo root -> do
       index <-
@@ -132,6 +135,23 @@ run opts = do
   unless (null whole) exitFailure
   where
     files = reverse $ optFiles opts
+
+-- | Copy standard input to standard output, with locations in the shadow's
+-- files rewritten to the files they were split from.
+locate :: FilePath -> IO ()
+locate out = do
+  outAbs <- canonicalizePath out
+  let projectFile = outAbs </> ".shatter-cache" </> "project"
+  known <- doesFileExist projectFile
+  unless known . die $ out ++ ": not a shadow made by --shadow"
+  project <- lines <$> readFile projectFile
+  case project of
+    root : packages -> do
+      places <- loadPlaces root outAbs packages
+      cwd <- getCurrentDirectory
+      hSetBuffering stdout LineBuffering
+      mapM_ putStrLn . relocate cwd places . lines =<< getContents
+    [] -> die $ projectFile ++ ": empty"
 
 -- | Say which modules of each package to divide for a faster build.
 advice :: Options -> IO ()
@@ -244,6 +264,13 @@ shadow opts out = do
     (concat [map (makeRelative root (libDir lib) </>) (libSourceDirs lib) | lib <- libs])
     (concat [(makeRelative root (libDir lib) </> libCabalFile lib) : [f | (_, _, f) <- files] | (lib, files) <- zip libs located])
   -- This program by its size and time, which is quicker than hashing it.
+  -- For --locate: the project's directory and the packages split.
+  createDirectoryIfMissing True $ outAbs </> ".shatter-cache"
+  do
+    let text = unlines $ root : [makeRelative root $ libDir lib | lib <- libs]
+        to = outAbs </> ".shatter-cache" </> "project"
+    same <- sameText to text
+    unless same $ writeFile to text
   exe <- do
     path <- getExecutablePath
     (,) <$> getFileSize path <*> (show <$> getModificationTime path)
@@ -386,6 +413,7 @@ parse opts = \case
     | Just k <- readMaybe n -> parse opts{optTop = Just k} rest
     | otherwise -> Left $ "--top needs a number, not " ++ n
   "--with-ghc" : ghc : rest -> parse opts{optWithGhc = Just ghc} rest
+  "--locate" : dir : rest -> parse opts{optMode = Locate dir} rest
   "--advise" : rest -> parse opts{optMode = Advise} rest
   "--pieces" : n : rest
     | Just k <- readMaybe n, k > 1 -> parse opts{optPieces = k} rest
@@ -412,6 +440,7 @@ usage =
     , "       cabal-shatter --split --out SOURCE-DIR [--pack MS] [--costs FILE] [--direct] [GHC] FILE ..."
     , "       cabal-shatter --list-modules [--pack MS] [--costs FILE] [GHC] FILE ..."
     , "       cabal-shatter --timings DUMP-DIR"
+    , "       cabal build --project-dir OUT-DIR 2>&1 | cabal-shatter --locate OUT-DIR"
     , "       cabal-shatter --advise [--costs FILE] [--pieces N] [--steps N] [--root PROJECT-DIR]"
     , "                     [--builddir DIR] [--flag [-]NAME] [GHC] PACKAGE-DIR ..."
     , "       cabal-shatter --shadow OUT-DIR [--root PROJECT-DIR] [--builddir DIR] [--flag [-]NAME]"
@@ -437,6 +466,8 @@ usage =
     , "--shadow DIR    mirror the project in DIR with links, and split the main library of"
     , "                each PACKAGE-DIR there, with --direct and --pack 150 unless given;"
     , "                the module list, extensions and CPP options come from the package"
+    , "--locate DIR    copy standard input to standard output, rewriting locations in the"
+    , "                files of the shadow DIR to the files they were split from"
     , "--root DIR      the project's directory, when it is not the current one"
     , "--builddir DIR  where to look for the cabal_macros.h of a package that uses CPP;"
     , "                by default dist-newstyle in the shadow, then in the project"

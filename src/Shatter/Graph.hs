@@ -14,6 +14,7 @@ module Shatter.Graph
   , Group (..)
   , declNodes
   , declGroups
+  , pack
   , Used (..)
   , usedQualifiers
   , usedIn
@@ -26,7 +27,8 @@ import Data.Char (isAlphaNum)
 import Data.Data (Data, gmapQ)
 import Data.Foldable (toList)
 import Data.Graph (flattenSCC, stronglyConnComp)
-import Data.List (nub, sortOn)
+import Data.List (nub, partition, sortOn)
+import Data.Map.Lazy qualified as Lazy
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (mapMaybe, maybeToList)
@@ -278,6 +280,62 @@ declGroups ns = sortOn (Down . groupLines) . orphanDeps $ map group components
             , groupNodes = sorted
             , groupLines = sum [nodeLastLine n - nodeFirstLine n + 1 | n <- sorted]
             , groupNames = nub $ concatMap nodeBinds sorted
+            }
+
+-- | Pack groups into fragments of at least a given number of lines, so that
+-- a module doesn't turn into dozens of small ones. Every module costs GHC
+-- something whether or not it is recompiled.
+--
+-- Groups are packed by level: a group's level is one more than the highest
+-- level it depends on, so groups on one level don't depend on each other
+-- and any of them can share a fragment. Whole levels can be joined too.
+-- Either way the fragments can't end up depending on each other in a cycle.
+--
+-- * A level with at least that many lines is packed on its own: each group
+--   that is large enough stays alone, and the rest fill fragments in source
+--   order.
+-- * Smaller levels are joined to the levels above them until together they
+--   are large enough, and become one fragment.
+pack :: Int -> [Group] -> [Group]
+pack n gs
+  | n <= 0 = gs
+  | otherwise = sortOn (Down . groupLines) $ map merge fragments
+  where
+    byId = Map.fromList [(groupId g, g) | g <- gs]
+    -- Each level refers to the levels below it, so the map has to be lazy.
+    level = Lazy.map (\g -> 1 + maximum (0 : mapMaybe (`Map.lookup` level) (groupDeps g))) byId :: Map Int Int
+    levels = Map.elems $ Map.fromListWith (flip (++)) [(level Map.! groupId g, [g]) | g <- sortOn groupId gs]
+    size = sum . map groupLines
+
+    fragments = bands [] levels
+
+    bands held [] = [held | not (null held)]
+    bands held (l : ls)
+      | size l >= n = [held | not (null held)] ++ fill l ++ bands [] ls
+      | size (held ++ l) >= n = (held ++ l) : bands [] ls
+      | otherwise = bands (held ++ l) ls
+
+    fill l =
+      let (large, small) = partition ((>= n) . groupLines) l
+       in map pure large ++ bins [] small
+
+    bins held [] = [held | not (null held)]
+    bins held (g : rest)
+      | size (held ++ [g]) >= n && size rest >= n = (held ++ [g]) : bins [] rest
+      | otherwise = bins (held ++ [g]) rest
+
+    owner = Map.fromList [(groupId g, minimum $ map groupId f) | f <- fragments, g <- f]
+
+    merge f =
+      let gid = minimum $ map groupId f
+          members = sortOn groupId f
+       in Group
+            { groupId = gid
+            , groupDeps = nub . filter (/= gid) . mapMaybe (`Map.lookup` owner) $ concatMap groupDeps members
+            , groupOrphan = concatMap groupOrphan members
+            , groupNodes = sortOn nodeId $ concatMap groupNodes members
+            , groupLines = size members
+            , groupNames = concatMap groupNames members
             }
 
 -- | Make an orphan instance visible to the rest of the module.

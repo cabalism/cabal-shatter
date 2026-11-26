@@ -42,6 +42,7 @@ import Shatter.Graph
   , collect
   , declGroups
   , declNodes
+  , pack
   , usedIn
   , usedQualifiers
   , wrap
@@ -106,12 +107,13 @@ data Plan = Plan
 
 -- | Split a parsed module on its own, or say why it can't be split.
 split :: Parsed -> Either String Split
-split = fmap (render Nothing) . plan
+split = fmap (render Nothing) . plan 0
 
--- | Work out the groups and their names, or say why the module can't be
--- split.
-plan :: Parsed -> Either String Plan
-plan parsed
+-- | Work out the fragments and their names, or say why the module can't be
+-- split. The first argument is the least number of lines to pack into a
+-- fragment.
+plan :: Int -> Parsed -> Either String Plan
+plan packed parsed
   | not (null splices) = refuse $ "has top-level splices at lines " ++ linesOf splices
   | otherwise = do
       headerEnd <- header
@@ -120,14 +122,17 @@ plan parsed
           { planParsed = parsed
           , planNodes = nodes
           , planGroups = groups
-          , planNames = fragmentNames modName groups
+          , planNames = case groups of
+              -- A module that is one fragment stays one module.
+              [g] -> Map.singleton (groupId g) modName
+              _ -> fragmentNames modName groups
           , planHeaderEnd = headerEnd
           }
   where
     modName = parsedName parsed
     src = parsedSource parsed
     nodes = declNodes modName (parsedDecls parsed)
-    groups = sortOn groupId $ declGroups nodes
+    groups = sortOn groupId . pack packed $ declGroups nodes
     splices = filter ((== Splice) . nodeKind) nodes
     linesOf = intercalate ", " . map (show . nodeFirstLine)
     refuse why = Left $ modName ++ ": " ++ why ++ ", which the splitter does not handle"
@@ -167,13 +172,23 @@ planEntry p =
 -- where it would otherwise import those modules whole.
 render :: Maybe Package -> Plan -> Split
 render index p =
-  Split
-    { splitModule = modName
-    , splitFacade = facade
-    , splitFragments = [f | (f, _, _) <- rendered]
-    , splitDirect = sum [n | (_, n, _) <- rendered]
-    , splitKept = concat [k | (_, _, k) <- rendered]
-    }
+  case groups of
+    [_] ->
+      Split
+        { splitModule = modName
+        , splitFacade = whole
+        , splitFragments = []
+        , splitDirect = length [() | (_, True, _) <- wholeImports]
+        , splitKept = concat [k | (_, _, k) <- wholeImports]
+        }
+    _ ->
+      Split
+        { splitModule = modName
+        , splitFacade = facade
+        , splitFragments = [f | (f, _, _) <- rendered]
+        , splitDirect = sum [n | (_, n, _) <- rendered]
+        , splitKept = concat [k | (_, _, k) <- rendered]
+        }
   where
     parsed = planParsed p
     modName = parsedName parsed
@@ -204,6 +219,22 @@ render index p =
         | o <- Set.toList . Set.fromList $ concatMap (orphanModules (packageIndex pkg) . importModule . importSpec . snd) imports
         , o /= modName
         ]
+
+    -- A module that is one fragment is written as itself. On its own that
+    -- is the original text. Within a package its imports are still
+    -- replaced by imports of other modules' fragments.
+    -- The export list can name things the declarations don't.
+    wholeUsed = foldMap usedIn (parsedDecls parsed) <> foldMap usedIn (parsedExports parsed)
+    wholeImports = [importLines wholeUsed s d | (s, d) <- imports]
+    whole = case (index, parsedImportLines parsed) of
+      (Just _, Just (first, final)) ->
+        unlines $
+          ["{-# OPTIONS_GHC -Wno-unused-imports -Wno-dodgy-imports #-}"]
+            ++ take (first - 1) src
+            ++ concat [ls | (ls, _, _) <- wholeImports]
+            ++ orphans
+            ++ drop final src
+      _ -> unlines src
 
     fragment g =
       let own = [(nodeId n, s) | n <- groupNodes g, Just s <- [Map.lookup (nodeId n) slices]]
@@ -410,7 +441,6 @@ writeSplit root s = do
         (facadePath, splitFacade s)
           : (root </> modulePath (splitModule s) <.> "shatter-map", sliceMap)
           : [(root </> modulePath (fragmentModule f) <.> "hs", fragmentText f) | f <- splitFragments s]
-  createDirectoryIfMissing True fragmentDir
   results <- forM files $ \(path, text) -> do
     createDirectoryIfMissing True $ takeDirectory path
     exists <- doesFileExist path

@@ -30,6 +30,7 @@ data Mode = Report | SplitTo FilePath | ListModules
 data Options = Options
   { optMode :: Mode
   , optDirect :: Bool
+  , optPack :: Int
   , optTop :: Maybe Int
   , optWithGhc :: Maybe FilePath
   , optGhcFlags :: [String]
@@ -40,7 +41,7 @@ main :: IO ()
 main = do
   -- When run as @cabal shatter@, cabal passes the command name first.
   args <- dropWhile (== "shatter") <$> getArgs
-  case parse (Options Report False (Just 10) Nothing [] []) args of
+  case parse (Options Report False 0 (Just 10) Nothing [] []) args of
     Left err -> die $ err ++ "\n" ++ usage
     Right opts
       | null (optFiles opts) -> die usage
@@ -52,7 +53,7 @@ run opts@Options{optMode = Report} = do
   results <- mapM (parseFile (optWithGhc opts) (reverse $ optGhcFlags opts)) . reverse $ optFiles opts
   let (failed, parsed) = partitionEithers results
   mapM_ (hPutStrLn stderr) failed
-  mapM_ (putStrLn . report (optTop opts)) parsed
+  mapM_ (putStrLn . report (optTop opts) (optPack opts)) parsed
   unless (null failed) exitFailure
 run opts = do
   -- A module that can't be handled is reported and the rest carry on.
@@ -62,7 +63,7 @@ run opts = do
       if hasBoot
         then pure . Left $ file ++ ": has an hs-boot file, which the splitter does not handle"
         else parseFile (optWithGhc opts) (reverse $ optGhcFlags opts) file
-    pure . either (Left . (,) file) Right $ plan =<< result
+    pure . either (Left . (,) file) Right $ plan (optPack opts) =<< result
   let (whole, plans) = partitionEithers attempts
   mapM_ (hPutStrLn stderr . snd) whole
   case optMode opts of
@@ -118,6 +119,9 @@ parse opts = \case
   "--out" : dir : rest -> parse opts{optMode = SplitTo dir} rest
   "--direct" : rest -> parse opts{optDirect = True} rest
   "--list-modules" : rest -> parse opts{optMode = ListModules} rest
+  "--pack" : n : rest
+    | Just k <- readMaybe n -> parse opts{optPack = k} rest
+    | otherwise -> Left $ "--pack needs a number, not " ++ n
   "--all" : rest -> parse opts{optTop = Nothing} rest
   "--top" : n : rest
     | Just k <- readMaybe n -> parse opts{optTop = Just k} rest
@@ -131,13 +135,15 @@ parse opts = \case
 usage :: String
 usage =
   unlines
-    [ "usage: cabal-shatter --report [--top N | --all] [--with-ghc GHC] [-XEXTENSION ...] FILE ..."
-    , "       cabal-shatter --split --out SOURCE-DIR [--direct] [--with-ghc GHC] [-XEXTENSION ...] FILE ..."
-    , "       cabal-shatter --list-modules [--with-ghc GHC] [-XEXTENSION ...] FILE ..."
+    [ "usage: cabal-shatter --report [--pack N] [--top N | --all] [--with-ghc GHC] [-XEXTENSION ...] FILE ..."
+    , "       cabal-shatter --split --out SOURCE-DIR [--pack N] [--direct] [--with-ghc GHC] [-XEXTENSION ...] FILE ..."
+    , "       cabal-shatter --list-modules [--pack N] [--with-ghc GHC] [-XEXTENSION ...] FILE ..."
     , ""
     , "--report        print the groups of mutually dependent declarations in each module"
     , "--split         write each module under SOURCE-DIR as a facade and one fragment per group"
     , "--direct        with --split, given every module of a package: have a fragment import"
     , "                the fragments of other modules, not those modules whole"
     , "--list-modules  print the names of the fragment modules a split would write"
+    , "--pack N        pack groups into fragments of at least N lines; a module that packs"
+    , "                into one fragment is left as one module"
     ]

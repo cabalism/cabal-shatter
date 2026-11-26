@@ -27,7 +27,8 @@ module Shatter.Index
   ) where
 
 import Data.Char (isAlphaNum, isSpace)
-import Data.List (isPrefixOf)
+import Data.List (delete, isPrefixOf)
+import Data.Map.Lazy qualified as Lazy
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (listToMaybe, mapMaybe)
@@ -46,6 +47,7 @@ import GHC
   , moduleNameString
   , unLoc
   )
+import GHC.Types.Name.Reader (RdrName)
 import Shatter.Graph (Used (..), collect, rdr, usedIn)
 
 -- | The modules of the package, by name.
@@ -89,6 +91,8 @@ data Exports = Exports
   , exportsNames :: Set String
   -- ^ The names in the list, including the ones in parentheses after a
   -- type.
+  , exportsMembers :: Set String
+  -- ^ Only the names in parentheses after a type.
   , exportsWild :: Set String
   -- ^ The types and classes listed with @(..)@.
   , exportsModules :: Set String
@@ -136,16 +140,23 @@ wild item = case unLoc item of
   ie -> any (/= NoIEWildcard) (collect ie :: [IEWildcard])
 
 exportsOf :: String -> Maybe [LIE GhcPs] -> Exports
-exportsOf _ Nothing = Exports True mempty mempty mempty
+exportsOf _ Nothing = Exports True mempty mempty mempty mempty
 exportsOf self (Just items) = foldMap one items
   where
     one item = case unLoc item of
       IEModuleContents _ m
-        | moduleNameString (unLoc m) == self -> Exports True mempty mempty mempty
-        | otherwise -> Exports False mempty mempty . Set.singleton . moduleNameString $ unLoc m
+        | moduleNameString (unLoc m) == self -> Exports True mempty mempty mempty mempty
+        | otherwise -> Exports False mempty mempty mempty . Set.singleton . moduleNameString $ unLoc m
       ie
         | named ie ->
-            Exports False (usedNames $ usedIn ie) (if wild item then Set.singleton . rdr $ ieName ie else mempty) mempty
+            let names = map rdr (collect ie :: [RdrName])
+                self' = rdr $ ieName ie
+             in Exports
+                  False
+                  (Set.fromList names)
+                  (Set.fromList $ delete self' names)
+                  (if wild item then Set.singleton self' else mempty)
+                  mempty
         | otherwise -> mempty
     named = \case
       IEVar{} -> True
@@ -155,10 +166,10 @@ exportsOf self (Just items) = foldMap one items
       _ -> False
 
 instance Semigroup Exports where
-  Exports a b c d <> Exports e f g h = Exports (a || e) (b <> f) (c <> g) (d <> h)
+  Exports a b c d e <> Exports f g h i j = Exports (a || f) (b <> g) (c <> h) (d <> i) (e <> j)
 
 instance Monoid Exports where
-  mempty = Exports False mempty mempty mempty
+  mempty = Exports False mempty mempty mempty mempty
 
 -- | Whether an import could bring a name into scope, going by its list.
 allows :: ImportList -> String -> Bool
@@ -198,15 +209,26 @@ package ix = Package ix envs children
       Map.fromListWith
         (++)
         [ ((boundModule b, parent), [x])
-        | Known info <- Map.elems ix
+        | (name, Known info) <- Map.toList ix
         , (x, bounds) <- Map.toList $ infoBinders info
         , b <- bounds
         , Just parent <- [boundParent b]
+        , -- A fragment exports everything. A module left whole has its
+          -- own export list, which may keep some of a type's members in.
+          boundModule b /= name || lets (infoExports info) x parent
         ]
+
+    lets ex x parent =
+      exportsLocal ex
+        || parent `Set.member` exportsWild ex
+        || x `Set.member` exportsMembers ex
+        -- A field or method can be exported on its own. A constructor
+        -- can't, so one named after its type is not what the list means.
+        || (x /= parent && x `Set.member` exportsNames ex)
 
     -- Each module's exports refer lazily to those of the modules it
     -- imports. Source imports are not followed, so there are no cycles.
-    envs = Map.mapWithKey (\_ -> environment envs ix) ix
+    envs = Lazy.map (environment envs ix) ix
 
 -- | What a module exports.
 data Env = Env

@@ -69,6 +69,22 @@ An import that brings in everything, hides names, lists a type with `(..)`, or l
 
 The module's header comment is not copied, so editing it changes only the facade.
 
+## Packing
+
+One fragment per group gives a module dozens of fragments, and every module costs GHC something whether or not it is recompiled. `--pack N` packs groups into fragments of at least N lines:
+
+```
+cabal run cabal-shatter -- --split --pack 300 --out SOURCE-DIR FILE ...
+cabal run cabal-shatter -- --report --pack 300 FILE ...
+```
+
+- Groups are packed by level, where a group's level is one more than the highest level it depends on. Groups on one level don't depend on each other, so any of them can share a fragment.
+- A level with at least N lines is packed on its own: a group of N lines or more stays alone and the rest fill fragments in source order.
+- Smaller levels are joined to the levels above them until together they reach N lines, and become one fragment.
+- A module that packs into one fragment is left as one module, with no facade.
+
+Packing trades away some of the saving after an edit, and a fragment's name can change when a declaration is added, since the name comes from the least name in the fragment. `--report --pack N` shows the result before anything is written.
+
 ## Importing other modules' fragments
 
 By default a fragment imports other modules of the package as the original did, so it waits for the whole of each. With `--direct`, and every module of the package given in one run, a fragment imports the fragments that bind the names it uses:

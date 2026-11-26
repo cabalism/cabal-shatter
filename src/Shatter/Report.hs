@@ -4,7 +4,7 @@ module Shatter.Report
   ) where
 
 import Data.List (intercalate)
-import Shatter.Graph (Group (..), Kind (..), Node (..), declGroups, declNodes)
+import Shatter.Graph (Group (..), Kind (..), Node (..), declGroups, declNodes, pack)
 import Shatter.Parse (Parsed (..))
 import Text.PrettyPrint
   ( Doc
@@ -21,12 +21,13 @@ import Text.PrettyPrint
 import Text.Printf (printf)
 
 -- | Describe the groups a module would split into. The first argument is
--- how many of the largest groups to list; 'Nothing' lists them all.
-report :: Maybe Int -> Parsed -> String
-report top parsed = render $ vcat [summary, text "", sizes, text "", largest, problems]
+-- how many of the largest groups to list; 'Nothing' lists them all. The
+-- second is the least number of lines to pack into a fragment.
+report :: Maybe Int -> Int -> Parsed -> String
+report top packed parsed = render $ vcat [summary, text "", sizes, text "", largest, problems]
   where
     nodes = declNodes (parsedName parsed) (parsedDecls parsed)
-    groups = declGroups nodes
+    groups = pack packed $ declGroups nodes
     declLines = sum $ map groupLines groups
     share n = percent n declLines
 

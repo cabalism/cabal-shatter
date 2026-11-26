@@ -3,7 +3,7 @@ module Main (main) where
 import Control.Monad (forM, unless, when)
 import Data.Either (partitionEithers)
 import Data.Set qualified as Set
-import Data.List (isPrefixOf, partition, sortOn)
+import Data.List (isInfixOf, isPrefixOf, partition, sortOn)
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Map.Strict qualified as Map
 import Data.Map.Lazy qualified as Lazy
@@ -15,6 +15,7 @@ import Shatter.Costs (readCosts, showCosts, timingsUnder)
 import Shatter.Index (Entry (..), ImportSpec (..), Info (..), Package, package, textualEntry)
 import Shatter.Locate (loadPlaces, relocate)
 import Shatter.Parse (Cpp (..), parseFile)
+import Shatter.Plan (Local (..), readPlan)
 import Shatter.Report (report)
 import Shatter.Shadow (Library (..), findMacros, ghcVersion, mirror, readLibrary, withFragments)
 import Shatter.Graph (Group (..))
@@ -29,11 +30,13 @@ import Shatter.Split
   , render
   , writeSplit
   )
-import System.Directory (canonicalizePath, createDirectoryIfMissing, doesFileExist, getCurrentDirectory, getFileSize, getModificationTime)
+import System.Directory (canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getCurrentDirectory, getFileSize, getModificationTime)
 import System.FilePath (makeRelative, takeDirectory, (<.>), (</>))
-import System.Environment (getArgs, getExecutablePath)
-import System.Exit (die, exitFailure)
-import System.IO (BufferMode (..), hPutStr, hPutStrLn, hSetBuffering, stderr, stdout)
+import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
+import System.Environment (getArgs, getExecutablePath, lookupEnv)
+import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, waitForProcess)
+import System.Exit (die, exitFailure, exitWith)
+import System.IO (BufferMode (..), hGetContents, hPutStr, hPutStrLn, hSetBuffering, stderr, stdout)
 import Text.Read (readMaybe)
 
 data Mode = Report | SplitTo FilePath | ListModules | Timings FilePath | Shadow FilePath | Advise | Locate FilePath
@@ -48,7 +51,7 @@ data Options = Options
   , optGhcFlags :: [String]
   , optMacros :: [FilePath]
   , optCppFlags :: [String]
-  , optRoot :: FilePath
+  , optRoot :: Maybe FilePath
   , optBuildDirs :: [FilePath]
   , optFlags :: [(String, Bool)]
   , optPieces :: Int
@@ -63,13 +66,112 @@ main :: IO ()
 main = do
   -- When run as @cabal shatter@, cabal passes the command name first.
   args <- dropWhile (== "shatter") <$> getArgs
-  case parse (Options Report False Nothing Nothing (Just 10) Nothing [] [] [] "." [] [] 4 0 []) args of
-    Left err -> die $ err ++ "\n" ++ usage
-    Right opts
+  let defaults = Options Report False Nothing Nothing (Just 10) Nothing [] [] [] Nothing [] [] 4 0 []
+  case (break (`elem` cabalCommands) args, parse defaults args) of
+    -- A cabal command, with options of this program before it at most.
+    ((before, command : rest), _)
+      | Right opts <- parse defaults before
+      , null (optFiles opts) ->
+          wrap opts command rest
+    (_, Left err) -> die $ err ++ "\n" ++ usage
+    (_, Right opts)
       | Timings dir <- optMode opts -> putStr . showCosts =<< timingsUnder dir
       | Locate dir <- optMode opts -> locate dir
       | null (optFiles opts) -> die usage
       | otherwise -> run opts
+
+-- | The project's directory: the one given, or the nearest directory at or
+-- above the current one that has a @cabal.project@, or failing that the
+-- current one.
+projectRoot :: Options -> IO FilePath
+projectRoot opts = case optRoot opts of
+  Just dir -> canonicalizePath dir
+  Nothing -> do
+    cwd <- getCurrentDirectory
+    let up d = do
+          here <- doesFileExist $ d </> "cabal.project"
+          if here then pure d else if takeDirectory d == d then pure cwd else up (takeDirectory d)
+    up cwd
+
+-- | The cabal commands this program can run in a shadow.
+cabalCommands :: [String]
+cabalCommands = concat [[c, "v2-" ++ c, "new-" ++ c] | c <- ["build", "repl", "test", "run", "bench", "haddock"]]
+
+-- | Bring the shadow up to date, then run a cabal command in it. The
+-- command's output has its locations rewritten to the project's files.
+--
+-- A repl is run as it is, so that it keeps the terminal. Its @:reload@ is
+-- redefined to bring the shadow up to date first.
+wrap :: Options -> String -> [String] -> IO ()
+wrap opts command args = do
+  root <- projectRoot opts
+  let out = case optMode opts of
+        Shadow dir -> dir
+        _ -> root </> "dist-newstyle" </> "shatter"
+  dirs <- shadowWith True [a | a <- compilerArgs args] opts out
+  outAbs <- canonicalizePath out
+  cwd <- getCurrentDirectory
+  cabal <- fromMaybe "cabal" <$> lookupEnv "CABAL_EXTERNAL_CABAL_PATH"
+  -- Run where the user is, but in the shadow, so that targets given as
+  -- paths mean the same.
+  let inShadow = outAbs </> makeRelative root cwd
+  there <- doesDirectoryExist inShadow
+  let place = if there && (cwd == root || (root ++ "/") `isPrefixOf` cwd) then inShadow else outAbs
+      isRepl = command `elem` ["repl", "v2-repl", "new-repl"]
+  self <- getExecutablePath
+  costs <- traverse canonicalizePath $ optCosts opts
+  let again =
+        unwords . map quote $
+          [self, "--shadow", outAbs, "--root", root]
+            ++ maybe [] (\n -> ["--pack", show n]) (optPack opts)
+            ++ maybe [] (\f -> ["--costs", f]) costs
+            ++ concat [["--flag", (if on then "" else "-") ++ f] | (f, on) <- reverse $ optFlags opts]
+            ++ concat [["--builddir", d] | d <- optBuildDirs opts]
+            ++ dirs
+      quote a = "'" ++ concatMap (\c -> if c == '\'' then "'\\''" else [c]) a ++ "'"
+      script = outAbs </> ".shatter-cache" </> "ghci-script"
+  if isRepl
+    then do
+      writeFile script . unlines $
+        [ ":def! reload \\_ -> return " ++ show (":!" ++ again ++ " 2>/dev/null\n::reload")
+        , ":def! r \\_ -> return \":reload\""
+        ]
+      (_, _, _, h) <-
+        createProcess
+          (proc cabal $ command : "--project-dir" : outAbs : ("--repl-options=-ghci-script=" ++ script) : args){cwd = Just place}
+      exitWith =<< waitForProcess h
+    else do
+      places <- do
+        project <- lines <$> readFile (outAbs </> ".shatter-cache" </> "project")
+        loadPlaces root outAbs $ drop 1 project
+      (_, Just o, Just e, h) <-
+        createProcess
+          (proc cabal $ command : "--project-dir" : outAbs : args)
+            { cwd = Just place
+            , std_out = CreatePipe
+            , std_err = CreatePipe
+            }
+      let pump from to = do
+            done <- newEmptyMVar
+            _ <- forkIO $ do
+              hSetBuffering to LineBuffering
+              mapM_ (hPutStrLn to) . relocate cwd places . lines =<< hGetContents from
+              putMVar done ()
+            pure done
+      a <- pump o stdout
+      b <- pump e stderr
+      takeMVar a
+      takeMVar b
+      exitWith =<< waitForProcess h
+  where
+    -- The options that choose the compiler and project, which decide the
+    -- plan and so have to go to the dry run that finds the packages.
+    compilerArgs = \case
+      "-w" : x : rest -> "-w" : x : compilerArgs rest
+      a : rest
+        | any (`isPrefixOf` a) ["-w", "--with-compiler=", "--project-file="] -> a : compilerArgs rest
+        | otherwise -> compilerArgs rest
+      [] -> []
 
 run :: Options -> IO ()
 run opts@Options{optMode = Report} = do
@@ -80,7 +182,7 @@ run opts@Options{optMode = Report} = do
   mapM_ (hPutStrLn stderr) failed
   mapM_ (putStrLn . report (optTop opts) (fromMaybe 0 $ optPack opts) costs) parsed
   unless (null failed) exitFailure
-run opts@Options{optMode = Shadow out} = shadow opts out
+run opts@Options{optMode = Shadow out} = () <$ shadowWith False [] opts out
 run opts@Options{optMode = Advise} = advice opts
 run opts = do
   costs <- maybe (pure mempty) readCosts $ optCosts opts
@@ -157,7 +259,7 @@ locate out = do
 advice :: Options -> IO ()
 advice opts = do
   measured <- maybe (pure mempty) readCosts $ optCosts opts
-  root <- canonicalizePath $ optRoot opts
+  root <- projectRoot opts
   dirs <- mapM canonicalizePath . reverse $ optFiles opts
   let builddirs = case optBuildDirs opts of
         [] -> [root </> "dist-newstyle"]
@@ -235,26 +337,62 @@ advice opts = do
       ++ secs (total adviceAfter)
       ++ " with the modules divided"
 
--- | Mirror the project and split the main library of each package given.
-shadow :: Options -> FilePath -> IO ()
-shadow opts out = do
+-- | Mirror the project and split the main library of each package given,
+-- or of every local package in the project's plan when none is given. The
+-- result is the directories of the packages split.
+--
+-- The flag says whether this is part of running a command, when less is
+-- printed. The strings are options for cabal, should it have to be asked
+-- for the plan.
+shadowWith :: Bool -> [String] -> Options -> FilePath -> IO [FilePath]
+shadowWith quiet planArgs opts out = do
   costs <- maybe (pure mempty) readCosts $ optCosts opts
-  root <- canonicalizePath $ optRoot opts
+  root <- projectRoot opts
   createDirectoryIfMissing True out
   outAbs <- canonicalizePath out
-  dirs <- mapM canonicalizePath . reverse $ optFiles opts
+  given <- mapM canonicalizePath . reverse $ optFiles opts
   let builddirs = case optBuildDirs opts of
         [] -> [outAbs </> "dist-newstyle", root </> "dist-newstyle"]
         ds -> ds
       pack = fromMaybe 150 $ optPack opts
-  libs <- forM dirs $ \dir ->
-    either die pure =<< readLibrary ghcVersion (optFlags opts) dir
+      planDir = outAbs </> ".shatter-cache" </> "plan"
+      plans = [d </> "cache" </> "plan.json" | d <- builddirs ++ [planDir]]
+      -- The shadow's own plan names the shadow's directories.
+      home dir
+        | (outAbs ++ "/") `isPrefixOf` dir = root </> makeRelative outAbs dir
+        | dir == outAbs = root
+        | otherwise = dir
+      findPlan = listToMaybe . catMaybes <$> mapM readPlan plans
+  found <- findPlan
+  -- With no plan and no packages named, ask cabal for the plan.
+  planned <- case found of
+    Nothing | null given -> do
+      cabal <- fromMaybe "cabal" <$> lookupEnv "CABAL_EXTERNAL_CABAL_PATH"
+      (_, _, _, h) <-
+        createProcess
+          (proc cabal $ ["build", "all", "--dry-run", "-v0", "--builddir=" ++ planDir] ++ planArgs){cwd = Just root}
+      _ <- waitForProcess h
+      findPlan
+    _ -> pure found
+  locals <- fmap catMaybes . forM (fromMaybe [] planned) $ \l -> do
+    let dir = home $ localDir l
+    exists <- doesDirectoryExist dir
+    if exists then (\d -> Just l{localDir = d}) <$> canonicalizePath dir else pure Nothing
+  -- A flag given here wins over the plan's setting, which wins over the
+  -- package's default.
+  let flagsFor dir = optFlags opts ++ concat [localFlags l | l <- locals, localDir l == dir]
+  libs <-
+    if null given
+      then fmap (either (const []) pure) `foldMap'` [readLibrary ghcVersion (flagsFor d) d | d <- map localDir locals, d == root || (root ++ "/") `isPrefixOf` d]
+      else forM given $ \dir -> either die pure =<< readLibrary ghcVersion (flagsFor dir) dir
+  when (null libs) . die $
+    "no package with a library found in the project's plan; name the package directories"
   -- Where each module's source is, for the modules written in plain Haskell.
   located <- forM libs $ \lib ->
     fmap catMaybes . forM (libModules lib) $ \m -> do
       let rel d = makeRelative root (libDir lib) </> d </> map (\c -> if c == '.' then '/' else c) m <.> "hs"
-      found <- mapM (\d -> (,) d <$> doesFileExist (root </> rel d)) $ libSourceDirs lib
-      pure $ case [d | (d, True) <- found] of
+      sources <- mapM (\d -> (,) d <$> doesFileExist (root </> rel d)) $ libSourceDirs lib
+      pure $ case [d | (d, True) <- sources] of
         d : _ -> Just (m, d, rel d)
         [] -> Nothing
   mirror
@@ -365,7 +503,7 @@ shadow opts out = do
         same <- sameText to text
         unless same $ writeFile to text
     writeCache cacheFile $ Cache key after
-    hPutStrLn stderr . unwords $
+    unless (quiet && null readNow) . hPutStrLn stderr . unwords $
       [ libId lib ++ ":"
       , show $ length files
       , "modules,"
@@ -376,11 +514,15 @@ shadow opts out = do
       , show $ length [() | c <- inOrder, Just _ <- [cachedRefused c]]
       , "left whole"
       ]
-    when (macros == Nothing) . hPutStrLn stderr $
-      "  no cabal_macros.h found for it: modules that use CPP may fail to preprocess until it has been built once"
+    when (macros == Nothing && or [True | (_, Left msg, _) <- readNow, "preprocessor failed" `isInfixOf` msg]) . hPutStrLn stderr $
+      "  no cabal_macros.h found for it yet, so some modules that use CPP are left whole until the next run"
     pure [msg | (_, Left msg, _) <- readNow]
-  mapM_ (hPutStrLn stderr . ("  " ++)) $ concat refusals
-  hPutStrLn stderr $ "build with: cabal build --project-dir " ++ out
+  unless quiet $ do
+    mapM_ (hPutStrLn stderr . ("  " ++)) $ concat refusals
+    hPutStrLn stderr $ "build with: cabal build --project-dir " ++ out
+  pure $ map libDir libs
+  where
+    foldMap' f = fmap concat . mapM f
 
 -- | Whether a file holds this text already.
 sameText :: FilePath -> String -> IO Bool
@@ -422,7 +564,7 @@ parse opts = \case
     | Just k <- readMaybe n -> parse opts{optSteps = k} rest
     | otherwise -> Left $ "--steps needs a number, not " ++ n
   "--shadow" : dir : rest -> parse opts{optMode = Shadow dir} rest
-  "--root" : dir : rest -> parse opts{optRoot = dir} rest
+  "--root" : dir : rest -> parse opts{optRoot = Just dir} rest
   "--builddir" : dir : rest -> parse opts{optBuildDirs = optBuildDirs opts ++ [dir]} rest
   "--flag" : ('-' : name) : rest -> parse opts{optFlags = (name, False) : optFlags opts} rest
   "--flag" : name : rest -> parse opts{optFlags = (dropWhile (== '+') name, True) : optFlags opts} rest
@@ -436,7 +578,9 @@ parse opts = \case
 usage :: String
 usage =
   unlines
-    [ "usage: cabal-shatter --report [--pack MS] [--costs FILE] [--top N | --all] [GHC] FILE ..."
+    [ "usage: cabal-shatter [--shadow OUT-DIR] [--pack MS] [--costs FILE] [--flag [-]NAME]"
+    , "                     build|repl|test|run|bench|haddock CABAL-ARGUMENT ..."
+    , "       cabal-shatter --report [--pack MS] [--costs FILE] [--top N | --all] [GHC] FILE ..."
     , "       cabal-shatter --split --out SOURCE-DIR [--pack MS] [--costs FILE] [--direct] [GHC] FILE ..."
     , "       cabal-shatter --list-modules [--pack MS] [--costs FILE] [GHC] FILE ..."
     , "       cabal-shatter --timings DUMP-DIR"
@@ -446,6 +590,11 @@ usage =
     , "       cabal-shatter --shadow OUT-DIR [--root PROJECT-DIR] [--builddir DIR] [--flag [-]NAME]"
     , "                     [--pack MS] [--costs FILE] [GHC] PACKAGE-DIR ..."
     , ""
+    , "build, repl...  bring a shadow of the project up to date (see --shadow), then run"
+    , "                the cabal command in it, with the locations in its output"
+    , "                rewritten to the project's files; the shadow is"
+    , "                dist-newstyle/shatter unless --shadow names another, and the"
+    , "                packages and their flags come from the project's plan"
     , "--report        print the groups of mutually dependent declarations in each module"
     , "--split         write each module under SOURCE-DIR as a facade and one fragment per group"
     , "--direct        with --split, given every module of a package: have a fragment import"
@@ -468,7 +617,8 @@ usage =
     , "                the module list, extensions and CPP options come from the package"
     , "--locate DIR    copy standard input to standard output, rewriting locations in the"
     , "                files of the shadow DIR to the files they were split from"
-    , "--root DIR      the project's directory, when it is not the current one"
+    , "--root DIR      the project's directory; by default the nearest one at or above the"
+    , "                current directory that has a cabal.project"
     , "--builddir DIR  where to look for the cabal_macros.h of a package that uses CPP;"
     , "                by default dist-newstyle in the shadow, then in the project"
     , "--flag NAME     turn a package flag on, or off with -NAME, when reading the packages"

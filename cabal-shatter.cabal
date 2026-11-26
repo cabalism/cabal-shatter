@@ -31,6 +31,7 @@ library
     Shatter.Index
     Shatter.Locate
     Shatter.Parse
+    Shatter.Plan
     Shatter.Report
     Shatter.Shadow
     Shatter.Split
@@ -58,3 +59,4 @@ executable cabal-shatter
     , containers
     , directory
     , filepath
+    , process

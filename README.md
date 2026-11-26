@@ -31,7 +31,34 @@ How it works:
 - Times come from `--costs`: one line per module, as `--timings` writes from the `-ddump-timings` dumps of a serial build (`-j1`) of the package as it stands. A piece's share of its module's time is estimated from its size. Without `--costs` every time is an estimate from size.
 - The figures leave out what a build does besides compiling modules, and the fixed cost of each extra module, about 10 ms.
 
-## Building a project split
+## Building, testing and loading a project split
+
+```
+cabal-shatter build TARGET ...
+cabal-shatter test TARGET ...
+cabal-shatter repl TARGET
+```
+
+or, with the executable on the `PATH`, `cabal shatter build TARGET ...`. The command and everything after it go to cabal as they are; `run`, `bench` and `haddock` work the same way.
+
+Each run:
+
+1. Brings a shadow of the project up to date in `dist-newstyle/shatter`, as `--shadow` does, reading only the modules that changed.
+2. Runs the cabal command in the shadow, from the directory that matches the current one.
+3. Rewrites the locations in the command's output to the project's files, as `--locate` does.
+
+What it works out for itself:
+
+- **The project** is the nearest directory at or above the current one that has a `cabal.project`.
+- **The packages** are the local packages in the project's plan that have a library, with the flag settings the plan gives them. The plan is read from the shadow's build directory, then the project's; if neither has one, cabal is asked for it with a dry run.
+- **CPP macros** come from the shadow's build directory, so on the first run some modules that use CPP are left whole. The second run splits them.
+
+Options of this program go before the command: `--pack`, `--costs`, `--flag` to override the plan, and `--shadow DIR` for a shadow somewhere else.
+
+A repl is run as it is, so that it keeps the terminal, and its output is not rewritten: errors there name the shadow's files. Its `:reload` and `:r` are redefined to bring the shadow up to date first, so an edit to the project's files is picked up.
+
+## The shadow on its own
+
 
 ```
 cabal-shatter --shadow OUT-DIR [--flag NAME] PACKAGE-DIR ...
@@ -43,7 +70,8 @@ Run from the project's directory, or name it with `--root`. This makes `OUT-DIR`
 - **The mirror:** everything is a link to the original, apart from the directories that lead to a split library's sources, its sources, and its `.cabal` file. Build directories are not mirrored, so the shadow has its own `dist-newstyle`.
 - **The sources:** every module the library lists that is found as a `.hs` file is split, as with `--split --direct --pack 150`. A module that can't be split is copied. Other files in the source directories are links.
 - **The `.cabal` file:** a copy with the fragments in a second `other-modules` field at the top of the `library` section. Nothing else changes, so the library's exposed modules are the same.
-- **What is read from the package:** the module list, source directories, `default-language`, `default-extensions`, `cpp-options` and `include-dirs`. Conditionals are decided for this machine and compiler. Flags have their defaults unless set with `--flag NAME` or `--flag -NAME`; flags set in the project file are not read.
+- **What is read from the package:** the module list, source directories, `default-language`, `default-extensions`, `cpp-options` and `include-dirs`. Conditionals are decided for this machine and compiler. A flag has the setting given with `--flag NAME` or `--flag -NAME`, or else the one in the project's plan, or else its default.
+- **Which packages:** the directories named, or with none named every local package in the plan that has a library.
 - **CPP:** the `cabal_macros.h` for each package is looked for in the shadow's `dist-newstyle`, then the project's, or in each `--builddir` given. Before the first build there is none, and modules that need its macros are copied whole. Run the command again after that build to split them.
 
 After an edit to the original, run the command again and build. Only the files whose content changed are rewritten. A module deleted from the original leaves its files behind in the shadow.

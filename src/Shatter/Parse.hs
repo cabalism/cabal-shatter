@@ -11,6 +11,8 @@ import Control.Monad.IO.Class (liftIO)
 import Data.Char (isSpace, toLower)
 import Control.Exception (evaluate)
 import Data.Char (isDigit)
+import Data.IORef (IORef, modifyIORef, newIORef, readIORef)
+import System.IO.Unsafe (unsafePerformIO)
 import Data.List (intercalate, isInfixOf, isPrefixOf, unsnoc)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust, mapMaybe)
@@ -93,7 +95,7 @@ parseFile withGhc cpp extraFlags path = do
     Left err -> pure $ Left err
     Right src -> do
       let pragmas = languagePragmas src
-      libdir <- trim <$> readProcess ghc ["--print-libdir"] ""
+      libdir <- libdirOf ghc
       runGhc (Just libdir) $ do
         dflags0 <- getSessionDynFlags
         logger <- getLogger
@@ -120,6 +122,21 @@ parseFile withGhc cpp extraFlags path = do
                         [] -> Nothing
                         spans -> Just (minimum $ map fst spans, maximum $ map snd spans)
                     }
+
+-- | The compiler's library directory, asked for once per compiler.
+libdirOf :: FilePath -> IO FilePath
+libdirOf ghc = do
+  known <- readIORef libdirs
+  case lookup ghc known of
+    Just dir -> pure dir
+    Nothing -> do
+      dir <- trim <$> readProcess ghc ["--print-libdir"] ""
+      modifyIORef libdirs ((ghc, dir) :)
+      pure dir
+
+libdirs :: IORef [(FilePath, FilePath)]
+libdirs = unsafePerformIO $ newIORef []
+{-# NOINLINE libdirs #-}
 
 -- | Run GHC's preprocessing phase on a file and give back its text with
 -- CPP turned off.

@@ -1,8 +1,9 @@
 module Main (main) where
 
-import Control.Monad (forM, unless)
+import Control.Monad (forM, forM_, unless, when)
 import Data.Either (partitionEithers)
 import Data.List (isPrefixOf, sortOn)
+import Data.Maybe (catMaybes, fromMaybe)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (mapMaybe)
 import Data.Ord (Down (..))
@@ -10,6 +11,7 @@ import Shatter.Costs (readCosts, showCosts, timingsUnder)
 import Shatter.Index (Package, package, textualEntry)
 import Shatter.Parse (Cpp (..), parseFile)
 import Shatter.Report (report)
+import Shatter.Shadow (Library (..), findMacros, ghcVersion, mirror, readLibrary, withFragments)
 import Shatter.Split
   ( Fragment (..)
   , Plan
@@ -20,24 +22,28 @@ import Shatter.Split
   , render
   , writeSplit
   )
-import System.Directory (doesFileExist)
+import System.Directory (canonicalizePath, createDirectoryIfMissing, doesFileExist)
+import System.FilePath (makeRelative, takeDirectory, (<.>), (</>))
 import System.Environment (getArgs)
 import System.Exit (die, exitFailure)
 import System.IO (hPutStr, hPutStrLn, stderr)
 import Text.Read (readMaybe)
 
-data Mode = Report | SplitTo FilePath | ListModules | Timings FilePath
+data Mode = Report | SplitTo FilePath | ListModules | Timings FilePath | Shadow FilePath
 
 data Options = Options
   { optMode :: Mode
   , optDirect :: Bool
-  , optPack :: Double
+  , optPack :: Maybe Double
   , optCosts :: Maybe FilePath
   , optTop :: Maybe Int
   , optWithGhc :: Maybe FilePath
   , optGhcFlags :: [String]
   , optMacros :: [FilePath]
   , optCppFlags :: [String]
+  , optRoot :: FilePath
+  , optBuildDirs :: [FilePath]
+  , optFlags :: [(String, Bool)]
   , optFiles :: [FilePath]
   }
 
@@ -48,7 +54,7 @@ main :: IO ()
 main = do
   -- When run as @cabal shatter@, cabal passes the command name first.
   args <- dropWhile (== "shatter") <$> getArgs
-  case parse (Options Report False 0 Nothing (Just 10) Nothing [] [] [] []) args of
+  case parse (Options Report False Nothing Nothing (Just 10) Nothing [] [] [] "." [] [] []) args of
     Left err -> die $ err ++ "\n" ++ usage
     Right opts
       | Timings dir <- optMode opts -> putStr . showCosts =<< timingsUnder dir
@@ -62,8 +68,9 @@ run opts@Options{optMode = Report} = do
   results <- mapM (parseFile (optWithGhc opts) (optCpp opts) (reverse $ optGhcFlags opts)) . reverse $ optFiles opts
   let (failed, parsed) = partitionEithers results
   mapM_ (hPutStrLn stderr) failed
-  mapM_ (putStrLn . report (optTop opts) (optPack opts) costs) parsed
+  mapM_ (putStrLn . report (optTop opts) (fromMaybe 0 $ optPack opts) costs) parsed
   unless (null failed) exitFailure
+run opts@Options{optMode = Shadow out} = shadow opts out
 run opts = do
   costs <- maybe (pure mempty) readCosts $ optCosts opts
   -- A module that can't be handled is reported and the rest carry on.
@@ -73,12 +80,13 @@ run opts = do
       if hasBoot
         then pure . Left $ file ++ ": has an hs-boot file, which the splitter does not handle"
         else parseFile (optWithGhc opts) (optCpp opts) (reverse $ optGhcFlags opts) file
-    pure . either (Left . (,) file) Right $ plan (optPack opts) costs =<< result
+    pure . either (Left . (,) file) Right $ plan (fromMaybe 0 $ optPack opts) costs =<< result
   let (whole, plans) = partitionEithers attempts
   mapM_ (hPutStrLn stderr . snd) whole
   case optMode opts of
     Report -> pure ()
     Timings _ -> pure ()
+    Shadow _ -> pure ()
     ListModules -> mapM_ (mapM_ (putStrLn . fragmentModule) . splitFragments . render Nothing) plans
     SplitTo root -> do
       index <-
@@ -115,6 +123,88 @@ run opts = do
   where
     files = reverse $ optFiles opts
 
+-- | Mirror the project and split the main library of each package given.
+shadow :: Options -> FilePath -> IO ()
+shadow opts out = do
+  costs <- maybe (pure mempty) readCosts $ optCosts opts
+  root <- canonicalizePath $ optRoot opts
+  createDirectoryIfMissing True out
+  outAbs <- canonicalizePath out
+  dirs <- mapM canonicalizePath . reverse $ optFiles opts
+  let builddirs = case optBuildDirs opts of
+        [] -> [outAbs </> "dist-newstyle", root </> "dist-newstyle"]
+        ds -> ds
+      pack = fromMaybe 150 $ optPack opts
+  libs <- forM dirs $ \dir ->
+    either die pure =<< readLibrary ghcVersion (optFlags opts) dir
+  -- Where each module's source is, for the modules written in plain Haskell.
+  located <- forM libs $ \lib ->
+    fmap catMaybes . forM (libModules lib) $ \m -> do
+      let rel d = makeRelative root (libDir lib) </> d </> map (\c -> if c == '.' then '/' else c) m <.> "hs"
+      found <- mapM (\d -> (,) d <$> doesFileExist (root </> rel d)) $ libSourceDirs lib
+      pure $ case [d | (d, True) <- found] of
+        d : _ -> Just (m, d, rel d)
+        [] -> Nothing
+  mirror
+    root
+    outAbs
+    [makeRelative root $ libDir lib | lib <- libs]
+    (concat [map (makeRelative root (libDir lib) </>) (libSourceDirs lib) | lib <- libs])
+    (concat [(makeRelative root (libDir lib) </> libCabalFile lib) : [f | (_, _, f) <- files] | (lib, files) <- zip libs located])
+  refusals <- forM (zip libs located) $ \(lib, files) -> do
+    macros <- findMacros builddirs lib
+    let cpp = Cpp (maybe [] pure macros ++ reverse (optMacros opts)) (libCppFlags lib ++ reverse (optCppFlags opts))
+        flags = libGhcFlags lib ++ reverse (optGhcFlags opts)
+    attempts <- forM files $ \(_, d, f) -> do
+      let file = root </> f
+      hasBoot <- doesFileExist $ file ++ "-boot"
+      result <-
+        if hasBoot
+          then pure . Left $ file ++ ": has an hs-boot file, which the splitter does not handle"
+          else parseFile (optWithGhc opts) cpp flags file
+      pure . either (Left . (,,) f file) (Right . (,) d) $ plan pack costs =<< result
+    let (whole, plans) = partitionEithers attempts
+    index <- packageOf [file | (_, file, _) <- whole] $ map snd plans
+    splits <- forM plans $ \(d, p) -> do
+      let s = render (Just index) p
+      _ <- writeSplit (outAbs </> makeRelative root (libDir lib) </> d) s
+      pure s
+    -- A module that can't be split is copied, so that the shadow never
+    -- holds a link where a later run may write.
+    forM_ whole $ \(f, file, _) -> do
+      text <- readFile file
+      let to = outAbs </> f
+      createDirectoryIfMissing True $ takeDirectory to
+      same <- do
+        exists <- doesFileExist to
+        if exists then (== text) <$> (readFile to >>= \t -> length t `seq` pure t) else pure False
+      unless same $ writeFile to text
+    let fragments = concatMap (map fragmentModule . splitFragments) splits
+        cabalFile = libDir lib </> libCabalFile lib
+    original <- readFile cabalFile
+    case withFragments fragments original of
+      Nothing -> die $ cabalFile ++ ": no library section found to add the fragments to"
+      Just text -> do
+        let to = outAbs </> makeRelative root cabalFile
+        same <- do
+          exists <- doesFileExist to
+          if exists then (== text) <$> (readFile to >>= \t -> length t `seq` pure t) else pure False
+        unless same $ writeFile to text
+    hPutStrLn stderr . unwords $
+      [ libId lib ++ ":"
+      , show $ length files
+      , "modules,"
+      , show $ length fragments
+      , "fragments,"
+      , show $ length whole
+      , "left whole"
+      ]
+    when (macros == Nothing) . hPutStrLn stderr $
+      "  no cabal_macros.h found for it: modules that use CPP may fail to preprocess until it has been built once"
+    pure [msg | (_, _, msg) <- whole]
+  mapM_ (hPutStrLn stderr . ("  " ++)) $ concat refusals
+  hPutStrLn stderr $ "build with: cabal build --project-dir " ++ out
+
 -- | What every module of the package binds, exports and imports. The files
 -- that couldn't be split are scanned as text.
 packageOf :: [FilePath] -> [Plan] -> IO Package
@@ -131,7 +221,7 @@ parse opts = \case
   "--direct" : rest -> parse opts{optDirect = True} rest
   "--list-modules" : rest -> parse opts{optMode = ListModules} rest
   "--pack" : n : rest
-    | Just k <- readMaybe n -> parse opts{optPack = k} rest
+    | Just k <- readMaybe n -> parse opts{optPack = Just k} rest
     | otherwise -> Left $ "--pack needs a number of milliseconds, not " ++ n
   "--costs" : file : rest -> parse opts{optCosts = Just file} rest
   "--timings" : dir : rest -> parse opts{optMode = Timings dir} rest
@@ -140,6 +230,11 @@ parse opts = \case
     | Just k <- readMaybe n -> parse opts{optTop = Just k} rest
     | otherwise -> Left $ "--top needs a number, not " ++ n
   "--with-ghc" : ghc : rest -> parse opts{optWithGhc = Just ghc} rest
+  "--shadow" : dir : rest -> parse opts{optMode = Shadow dir} rest
+  "--root" : dir : rest -> parse opts{optRoot = dir} rest
+  "--builddir" : dir : rest -> parse opts{optBuildDirs = optBuildDirs opts ++ [dir]} rest
+  "--flag" : ('-' : name) : rest -> parse opts{optFlags = (name, False) : optFlags opts} rest
+  "--flag" : name : rest -> parse opts{optFlags = (dropWhile (== '+') name, True) : optFlags opts} rest
   "--macros" : file : rest -> parse opts{optMacros = file : optMacros opts} rest
   flag : rest
     | "-D" `isPrefixOf` flag || "-I" `isPrefixOf` flag -> parse opts{optCppFlags = flag : optCppFlags opts} rest
@@ -154,6 +249,8 @@ usage =
     , "       cabal-shatter --split --out SOURCE-DIR [--pack MS] [--costs FILE] [--direct] [GHC] FILE ..."
     , "       cabal-shatter --list-modules [--pack MS] [--costs FILE] [GHC] FILE ..."
     , "       cabal-shatter --timings DUMP-DIR"
+    , "       cabal-shatter --shadow OUT-DIR [--root PROJECT-DIR] [--builddir DIR] [--flag [-]NAME]"
+    , "                     [--pack MS] [--costs FILE] [GHC] PACKAGE-DIR ..."
     , ""
     , "--report        print the groups of mutually dependent declarations in each module"
     , "--split         write each module under SOURCE-DIR as a facade and one fragment per group"
@@ -166,6 +263,13 @@ usage =
     , "                without one are estimated from their size"
     , "--timings DIR   print the compile time of each module from the .dump-timings files"
     , "                under DIR, for --costs; the build has to be serial and unpacked"
+    , "--shadow DIR    mirror the project in DIR with links, and split the main library of"
+    , "                each PACKAGE-DIR there, with --direct and --pack 150 unless given;"
+    , "                the module list, extensions and CPP options come from the package"
+    , "--root DIR      the project's directory, when it is not the current one"
+    , "--builddir DIR  where to look for the cabal_macros.h of a package that uses CPP;"
+    , "                by default dist-newstyle in the shadow, then in the project"
+    , "--flag NAME     turn a package flag on, or off with -NAME, when reading the packages"
     , ""
     , "GHC is any of: --with-ghc GHC, -XEXTENSION, --macros HEADER, -DMACRO, -IDIR"
     ]

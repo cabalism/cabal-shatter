@@ -4,7 +4,24 @@ An experiment in faking declaration-level recompilation for Haskell.
 
 GHC recompiles whole modules. `cabal-shatter` is meant to split a module on disk into one module per group of mutually dependent declarations, plus a facade with the original name and exports, so that GHC's ordinary recompilation check rebuilds only the group that was edited.
 
-Two stages exist: a report of the groups a module would split into, and the split itself. Nothing yet runs the split as part of a build.
+Three things exist: a report of the groups a module would split into, the split itself, and a shadow of a project in which the split libraries can be built with no change to the project.
+
+## Building a project split
+
+```
+cabal-shatter --shadow OUT-DIR [--flag NAME] PACKAGE-DIR ...
+cabal build --project-dir OUT-DIR
+```
+
+Run from the project's directory, or name it with `--root`. This makes `OUT-DIR` a mirror of the project and splits the main library of each package given.
+
+- **The mirror:** everything is a link to the original, apart from the directories that lead to a split library's sources, its sources, and its `.cabal` file. Build directories are not mirrored, so the shadow has its own `dist-newstyle`.
+- **The sources:** every module the library lists that is found as a `.hs` file is split, as with `--split --direct --pack 150`. A module that can't be split is copied. Other files in the source directories are links.
+- **The `.cabal` file:** a copy with the fragments in a second `other-modules` field at the top of the `library` section. Nothing else changes, so the library's exposed modules are the same.
+- **What is read from the package:** the module list, source directories, `default-language`, `default-extensions`, `cpp-options` and `include-dirs`. Conditionals are decided for this machine and compiler. Flags have their defaults unless set with `--flag NAME` or `--flag -NAME`; flags set in the project file are not read.
+- **CPP:** the `cabal_macros.h` for each package is looked for in the shadow's `dist-newstyle`, then the project's, or in each `--builddir` given. Before the first build there is none, and modules that need its macros are copied whole. Run the command again after that build to split them.
+
+After an edit to the original, run the command again and build. Only the files whose content changed are rewritten. A module deleted from the original leaves its files behind in the shadow.
 
 ## Usage
 
@@ -126,4 +143,6 @@ The run ends with how many imports were replaced and which modules' imports were
 - With `--direct`, an orphan instance that reaches a fragment only through a module outside the package can be lost, and so can the constructor of an external newtype.
 - A module that uses `RebindableSyntax` may lose an import it needs, because the names that syntax refers to are not written in the source.
 - Whole-module warnings for unused imports and unused top-level bindings are turned off in the fragments.
+- The shadow splits main libraries only. Sublibraries, executables and test suites are built from the original sources.
+- Every run of `--shadow` parses every module again, which takes about six seconds for the three largest packages of the cabal repository.
 - The `ghc` library ties the build to one compiler version, GHC 10.0 at present.

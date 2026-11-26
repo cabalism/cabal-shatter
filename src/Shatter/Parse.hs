@@ -3,15 +3,18 @@
 module Shatter.Parse
   ( Parsed (..)
   , parseFile
+  , lineSpan
   ) where
 
 import Control.Monad.IO.Class (liftIO)
 import Data.Char (isSpace, toLower)
 import Data.List (isInfixOf, isPrefixOf)
+import Data.Maybe (isJust, mapMaybe)
 import GHC
   ( GhcPs
   , HsModule (..)
   , LHsDecl
+  , getLocA
   , getSessionDynFlags
   , moduleNameString
   , noLoc
@@ -25,7 +28,7 @@ import GHC.Driver.Config.Parser (initParserOpts)
 import GHC.Utils.Logger (getLogger)
 import GHC.Parser (parseModule)
 import GHC.Parser.Lexer (P (unP), ParseResult (..), initParserState)
-import GHC.Types.SrcLoc (mkRealSrcLoc)
+import GHC.Types.SrcLoc (SrcSpan (..), mkRealSrcLoc, srcSpanEndLine, srcSpanStartLine)
 import GHC.Settings.Config (cProjectVersion)
 import System.Process (readProcess)
 
@@ -37,6 +40,14 @@ data Parsed = Parsed
   -- ^ The top-level declarations, in source order.
   , parsedLines :: Int
   -- ^ The number of lines in the file.
+  , parsedSource :: [String]
+  -- ^ The file's lines.
+  , parsedNameLine :: Maybe Int
+  -- ^ The line the module's name is on, when it has a header.
+  , parsedHasExports :: Bool
+  -- ^ Whether the header has an export list.
+  , parsedImportLines :: Maybe (Int, Int)
+  -- ^ The first and last lines of the imports.
   }
 
 -- | Parse a file. The extra flags are passed to GHC as if on the command
@@ -72,7 +83,19 @@ parseFile withGhc extraFlags path = do
                     { parsedName = maybe "Main" (moduleNameString . unLoc) $ hsmodName m
                     , parsedDecls = hsmodDecls m
                     , parsedLines = length $ lines src
+                    , parsedSource = lines src
+                    , parsedNameLine = fst <$> (lineSpan . getLocA =<< hsmodName m)
+                    , parsedHasExports = isJust $ hsmodExports m
+                    , parsedImportLines = case mapMaybe (lineSpan . getLocA) $ hsmodImports m of
+                        [] -> Nothing
+                        spans -> Just (minimum $ map fst spans, maximum $ map snd spans)
                     }
+
+-- | The first and last lines of a source span.
+lineSpan :: SrcSpan -> Maybe (Int, Int)
+lineSpan = \case
+  RealSrcSpan s _ -> Just (srcSpanStartLine s, srcSpanEndLine s)
+  _ -> Nothing
 
 -- | The extensions named in @LANGUAGE@ pragmas above the module header.
 languagePragmas :: String -> [String]

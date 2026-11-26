@@ -4,7 +4,7 @@ An experiment in faking declaration-level recompilation for Haskell.
 
 GHC recompiles whole modules. `cabal-shatter` is meant to split a module on disk into one module per group of mutually dependent declarations, plus a facade with the original name and exports, so that GHC's ordinary recompilation check rebuilds only the group that was edited.
 
-So far only the first stage exists: a report of the groups a module would split into.
+Two stages exist: a report of the groups a module would split into, and the split itself. Nothing yet runs the split as part of a build.
 
 ## Usage
 
@@ -19,6 +19,21 @@ Options:
 - `--with-ghc GHC` names the compiler to ask for the library directory. The default is the compiler the program was built with.
 
 With the executable on the `PATH`, `cabal shatter --report FILE` works too.
+
+To split a module, keep the original outside the package's source directory and write the split into it:
+
+```
+cabal run cabal-shatter -- --split --out SOURCE-DIR FILE ...
+cabal run cabal-shatter -- --list-modules FILE ...
+```
+
+For module `Foo.Bar` this writes, under `SOURCE-DIR`:
+
+- `Foo/Bar.hs`, a facade with the original header, export list and imports, importing every fragment.
+- `Foo/Bar/S_<name>.hs`, one fragment per group, named after the least name the group binds. Each has the original pragmas and imports, imports the fragments it depends on, and exports everything.
+- `Foo/Bar.shatter-map`, which lists for each fragment the lines copied from the original: fragment module, fragment line, original line, line count.
+
+A file whose content hasn't changed is not rewritten, so after an edit only one fragment changes. `--list-modules` prints the fragment module names to add to the package's module list.
 
 ## What the report says
 
@@ -45,5 +60,6 @@ The analysis is syntactic; nothing is renamed or typechecked.
 ## Limits
 
 - Modules that use CPP are refused.
-- Top-level Template Haskell splices are counted and reported; the splitter will refuse them.
+- Modules with top-level Template Haskell splices or orphan instances are reported but not split.
+- Whole-module warnings for unused imports and unused top-level bindings are turned off in the fragments.
 - The `ghc` library ties the build to one compiler version, GHC 10.0 at present.

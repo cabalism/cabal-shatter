@@ -66,7 +66,11 @@ data Node = Node
 
 -- | Declarations that have to be compiled together.
 data Group = Group
-  { groupNodes :: [Node]
+  { groupId :: Int
+  -- ^ The position of its first declaration, which identifies the group.
+  , groupDeps :: [Int]
+  -- ^ The other groups it mentions a name from.
+  , groupNodes :: [Node]
   , groupLines :: Int
   , groupNames :: [String]
   -- ^ The names the group binds, in source order.
@@ -167,7 +171,7 @@ sigSubjects = \case
 -- node joins the first of them, so an instance joins its class in
 -- preference to its type.
 declGroups :: [Node] -> [Group]
-declGroups ns = sortOn (Down . groupLines) . map (group . flattenSCC) $ stronglyConnComp graph
+declGroups ns = sortOn (Down . groupLines) $ map group components
   where
     binders :: Map String [Int]
     binders = Map.fromListWith (flip (++)) [(b, [nodeId n]) | n <- ns, b <- nodeBinds n]
@@ -184,10 +188,26 @@ declGroups ns = sortOn (Down . groupLines) . map (group . flattenSCC) $ strongly
       | n <- ns
       ]
 
+    edges :: Map Int [Int]
+    edges = Map.fromList [(k, out) | (_, k, out) <- graph]
+
+    owner :: Map Int Int
+    owner = Map.fromList [(nodeId n, minimum $ map nodeId members) | members <- components, n <- members]
+
+    components = map flattenSCC $ stronglyConnComp graph
+
     group members =
       let sorted = sortOn nodeId members
+          gid = nodeId $ minimum' sorted
+          minimum' = foldr1 (\a b -> if nodeId a <= nodeId b then a else b)
        in Group
-            { groupNodes = sorted
+            { groupId = gid
+            , groupDeps =
+                nub
+                  . filter (/= gid)
+                  . mapMaybe (`Map.lookup` owner)
+                  $ concatMap (\n -> Map.findWithDefault [] (nodeId n) edges) sorted
+            , groupNodes = sorted
             , groupLines = sum [nodeLastLine n - nodeFirstLine n + 1 | n <- sorted]
             , groupNames = nub $ concatMap nodeBinds sorted
             }

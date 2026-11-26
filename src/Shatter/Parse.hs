@@ -40,6 +40,7 @@ import GHC.Types.SrcLoc (SrcSpan (..), mkRealSrcLoc, srcSpanEndLine, srcSpanStar
 import GHC.Settings.Config (cProjectVersion)
 import System.Directory (getTemporaryDirectory, removeFile)
 import System.Exit (ExitCode (..))
+import System.FilePath (normalise)
 import System.IO (hClose, openTempFile)
 import System.Process (readProcess, readProcessWithExitCode)
 
@@ -79,9 +80,10 @@ data Cpp = Cpp
 -- line, for extensions that the package turns on outside the file, such as
 -- @-XHaskell2010@.
 --
--- The GHC library needs the compiler's library directory, so this runs
--- @ghc --print-libdir@ with the given compiler, or with the compiler this
--- program was built against when none is given.
+-- The GHC library needs its compiler's library directory, so this runs
+-- @ghc --print-libdir@ with the compiler this program was built against.
+-- The compiler given, if any, is the one the package is built with: it
+-- does the preprocessing, so that its own macros are the ones defined.
 --
 -- A module that uses CPP is preprocessed first, and what is parsed and
 -- split is the preprocessor's output: the text GHC would have compiled
@@ -96,7 +98,9 @@ parseFile withGhc cpp extraFlags path = do
     Left err -> pure $ Left err
     Right src -> do
       let pragmas = languagePragmas src
-      libdir <- libdirOf ghc
+      -- The parser is the one this program was built with, whichever
+      -- compiler does the preprocessing.
+      libdir <- libdirOf $ "ghc-" ++ cProjectVersion
       runGhc (Just libdir) $ do
         dflags0 <- getSessionDynFlags
         logger <- getLogger
@@ -168,7 +172,8 @@ realign path = fill 1 . Map.toAscList . go Nothing Map.empty
   where
     go _ acc [] = acc
     go at acc (l : ls) = case marker l of
-      Just (n, file) -> go (if file == path then Just n else Nothing) acc ls
+      -- The preprocessor may tidy the path it was given.
+      Just (n, file) -> go (if normalise file == normalise path then Just n else Nothing) acc ls
       Nothing -> case at of
         Just n -> go (Just $ n + 1) (Map.insert n l acc) ls
         Nothing -> go Nothing acc ls

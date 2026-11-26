@@ -2,6 +2,7 @@
 -- the @plan.json@ that cabal writes in its build directory.
 module Shatter.Plan
   ( Local (..)
+  , ProjectPlan (..)
   , readPlan
   ) where
 
@@ -18,8 +19,15 @@ data Local = Local
   , localFlags :: [(String, Bool)]
   }
 
--- | The local packages in a plan file, or 'Nothing' if it can't be read.
-readPlan :: FilePath -> IO (Maybe [Local])
+data ProjectPlan = ProjectPlan
+  { planCompiler :: String
+  -- ^ As cabal names it, such as @ghc-9.4.7@.
+  , planLocals :: [Local]
+  }
+
+-- | The compiler and local packages in a plan file, or 'Nothing' if it
+-- can't be read.
+readPlan :: FilePath -> IO (Maybe ProjectPlan)
 readPlan file = do
   text <- try (readFile file) :: IO (Either IOException String)
   pure $ case text of
@@ -27,7 +35,8 @@ readPlan file = do
     Right t -> do
       (plan, _) <- value t
       Array units <- field "install-plan" plan
-      pure . nubBy (\a b -> localDir a == localDir b) $ mapMaybe local units
+      String compiler <- field "compiler-id" plan
+      pure . ProjectPlan compiler . nubBy (\a b -> localDir a == localDir b) $ mapMaybe local units
   where
     local unit = do
       String "local" <- field "style" unit

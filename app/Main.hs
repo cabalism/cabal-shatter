@@ -3,7 +3,8 @@ module Main (main) where
 import Control.Monad (forM, unless, when)
 import Data.Either (partitionEithers)
 import Data.Set qualified as Set
-import Data.List (isInfixOf, isPrefixOf, partition, sortOn)
+import Data.List (isInfixOf, isPrefixOf, partition, sortOn, stripPrefix)
+import Distribution.Pretty (prettyShow)
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Map.Strict qualified as Map
 import Data.Map.Lazy qualified as Lazy
@@ -15,9 +16,9 @@ import Shatter.Costs (readCosts, showCosts, timingsUnder)
 import Shatter.Index (Entry (..), ImportSpec (..), Info (..), Package, package, textualEntry)
 import Shatter.Locate (loadPlaces, relocate)
 import Shatter.Parse (Cpp (..), parseFile)
-import Shatter.Plan (Local (..), readPlan)
+import Shatter.Plan (Local (..), ProjectPlan (..), readPlan)
 import Shatter.Report (report)
-import Shatter.Shadow (Library (..), findMacros, ghcVersion, mirror, readLibrary, withFragments)
+import Shatter.Shadow (Library (..), findMacros, ghcVersion, mirror, readLibrary, versionOf, withFragments)
 import Shatter.Graph (Group (..))
 import Shatter.Parse (Parsed (..))
 import Shatter.Split
@@ -31,10 +32,11 @@ import Shatter.Split
   , writeSplit
   )
 import System.Directory (canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getCurrentDirectory, getFileSize, getModificationTime, pathIsSymbolicLink, removeFile)
-import System.FilePath (makeRelative, splitDirectories, takeDirectory, (<.>), (</>))
+import System.Directory (findExecutable)
+import System.FilePath (makeRelative, normalise, splitDirectories, takeDirectory, (<.>), (</>))
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
 import System.Environment (getArgs, getExecutablePath, lookupEnv)
-import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, waitForProcess)
+import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, readProcess, waitForProcess)
 import System.Exit (die, exitFailure, exitWith)
 import System.IO (BufferMode (..), hGetContents, hPutStr, hPutStrLn, hSetBuffering, stderr, stdout)
 import Text.Read (readMaybe)
@@ -370,16 +372,16 @@ shadowWith quiet planArgs opts out = do
   costsStamp <- maybe (pure (0, 0)) stampFile $ optCosts opts
   let manifestFile = outAbs </> ".shatter-cache" </> "manifest"
       -- Everything on the command line that the result depends on.
-      argsStamp = stampOf (exe, root, given, optFlags opts, pack, optCosts opts, builddirs, (optGhcFlags opts, optMacros opts, optCppFlags opts, optWithGhc opts))
+      argsStamp = stampOf (exe, root, given, optFlags opts, pack, optCosts opts, builddirs, (optGhcFlags opts, optMacros opts, optCppFlags opts, optWithGhc opts, planArgs))
       -- Where each module's source is, for the modules written in plain Haskell.
       sourcesOf lib =
         fmap catMaybes . forM (libModules lib) $ \m -> do
-          let rel d = makeRelative root (libDir lib) </> d </> map (\c -> if c == '.' then '/' else c) m <.> "hs"
+          let rel d = normalise $ makeRelative root (libDir lib) </> d </> map (\c -> if c == '.' then '/' else c) m <.> "hs"
           sources <- mapM (\d -> (,) d <$> doesFileExist (root </> rel d)) $ libSourceDirs lib
           pure $ case [d | (d, True) <- sources] of
             d : _ -> Just (m, d, rel d)
             [] -> Nothing
-      splitLib flagsUsed (lib, files) = do
+      splitLib ghc flagsUsed (lib, files) = do
         macros <- findMacros builddirs lib
         let cpp = Cpp (maybe [] pure macros ++ reverse (optMacros opts)) (libCppFlags lib ++ reverse (optCppFlags opts))
             flags = libGhcFlags lib ++ reverse (optGhcFlags opts)
@@ -389,7 +391,7 @@ shadowWith quiet planArgs opts out = do
         -- any of it differs from the last run, every module is read again.
         headers <- mapM stampFile $ cppMacros cpp
         cabalStamp <- stampFile cabalFile
-        let key = stampOf (exe, costsStamp, headers, cabalStamp, pack, flags, cpp, optWithGhc opts, [f | (_, _, f) <- files])
+        let key = stampOf (exe, costsStamp, headers, cabalStamp, pack, flags, cpp, ghc, [f | (_, _, f) <- files])
         old <- readCache cacheFile
         let before = case old of
               Just c | cacheKey c == key -> cacheModules c
@@ -405,7 +407,7 @@ shadowWith quiet planArgs opts out = do
               result <-
                 if hasBoot
                   then pure . Left $ file ++ ": has an hs-boot file, which the splitter does not handle"
-                  else parseFile (optWithGhc opts) cpp flags file
+                  else parseFile ghc cpp flags file
               case plan pack costs =<< result of
                 Right p -> pure (x, Right p, planEntry p)
                 Left msg -> do
@@ -499,7 +501,22 @@ shadowWith quiet planArgs opts out = do
             _ <- waitForProcess h
             findPlan
           _ -> pure found
-        locals <- fmap catMaybes . forM (fromMaybe [] planned) $ \l -> do
+        -- The compiler the packages are built with: the one named here, or
+        -- to cabal, or in the plan. It preprocesses, and its version
+        -- decides the conditionals in the packages.
+        let fromArgs = \case
+              "-w" : x : _ -> Just x
+              a : rest
+                | Just x <- stripPrefix "--with-compiler=" a -> Just x
+                | Just x@(_ : _) <- stripPrefix "-w" a -> Just x
+                | otherwise -> fromArgs rest
+              [] -> Nothing
+        inPlan <- maybe (pure Nothing) (findExecutable . planCompiler) planned
+        let ghc = listToMaybe $ catMaybes [optWithGhc opts, fromArgs planArgs, inPlan]
+        version <- case ghc of
+          Just g -> versionOf <$> readProcess g ["--numeric-version"] ""
+          Nothing -> pure ghcVersion
+        locals <- fmap catMaybes . forM (maybe [] planLocals planned) $ \l -> do
           let dir = home $ localDir l
           exists <- doesDirectoryExist dir
           -- A package inside a build directory is some shadow's, not the
@@ -511,8 +528,8 @@ shadowWith quiet planArgs opts out = do
         let flagsFor dir = optFlags opts ++ concat [localFlags l | l <- locals, localDir l == dir]
         libs <-
           if null given
-            then fmap (either (const []) pure) `foldMap'` [readLibrary ghcVersion (flagsFor d) d | d <- map localDir locals, d == root || (root ++ "/") `isPrefixOf` d]
-            else forM given $ \dir -> either die pure =<< readLibrary ghcVersion (flagsFor dir) dir
+            then fmap (either (const []) pure) `foldMap'` [readLibrary version (flagsFor d) d | d <- map localDir locals, d == root || (root ++ "/") `isPrefixOf` d]
+            else forM given $ \dir -> either die pure =<< readLibrary version (flagsFor dir) dir
         when (null libs) . die $
           "no package with a library found in the project's plan; name the package directories"
         located <- mapM sourcesOf libs
@@ -529,9 +546,9 @@ shadowWith quiet planArgs opts out = do
               to = outAbs </> ".shatter-cache" </> "project"
           same <- sameText to text
           unless same $ unlink to >> writeFile to text
-        results <- forM (zip libs located) $ \(lib, files) -> splitLib (flagsFor $ libDir lib) (lib, files)
+        results <- forM (zip libs located) $ \(lib, files) -> splitLib ghc (flagsFor $ libDir lib) (lib, files)
         watched <- mapM (\f -> (,) f <$> statOf f) $ plans ++ maybe [] pure (optCosts opts) ++ [libDir lib </> libCabalFile lib | lib <- libs] ++ walked
-        writeManifest manifestFile $ Manifest argsStamp watched (map snd results)
+        writeManifest manifestFile $ Manifest argsStamp watched (map snd results) ghc (prettyShow version)
         unless quiet $ do
           mapM_ (hPutStrLn stderr . ("  " ++)) $ concatMap fst results
           hPutStrLn stderr $ "build with: cabal build --project-dir " ++ out
@@ -555,9 +572,9 @@ shadowWith quiet planArgs opts out = do
             if fresh
               then pure ml
               else do
-                lib <- either die pure =<< readLibrary ghcVersion (mlFlags ml) (mlDir ml)
+                lib <- either die pure =<< readLibrary (versionOf $ manGhcVersion m) (mlFlags ml) (mlDir ml)
                 files <- sourcesOf lib
-                snd <$> splitLib (mlFlags ml) (lib, files)
+                snd <$> splitLib (manGhc m) (mlFlags ml) (lib, files)
           writeManifest manifestFile m{manLibs = libs'}
           pure $ map mlDir libs'
     _ -> full

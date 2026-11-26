@@ -89,6 +89,10 @@ data Manifest = Manifest
   -- ^ What every library depends on: the plan, the .cabal files, the
   -- directories mirrored.
   , manLibs :: [ManLib]
+  , manGhc :: Maybe FilePath
+  -- ^ The compiler the packages are built with, if it isn't the one this
+  -- program was built with.
+  , manGhcVersion :: String
   }
   deriving (Generic)
 

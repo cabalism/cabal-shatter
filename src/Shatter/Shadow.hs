@@ -5,6 +5,7 @@ module Shatter.Shadow
   ( Library (..)
   , readLibrary
   , ghcVersion
+  , versionOf
   , withFragments
   , findMacros
   , mirror
@@ -12,7 +13,7 @@ module Shatter.Shadow
 
 import Control.Monad (filterM, forM, when)
 import Data.ByteString qualified as BS
-import Data.Char (isSpace, toLower)
+import Data.Char (isDigit, isSpace, toLower)
 import Data.List (isPrefixOf, nub)
 import Data.Maybe (fromMaybe, listToMaybe)
 import Distribution.Compiler (CompilerFlavor (..))
@@ -62,7 +63,12 @@ data Library = Library
 -- | The version of GHC this program was built with, which is the one whose
 -- parser it uses.
 ghcVersion :: Version
-ghcVersion = mkVersion . map read . words $ map (\c -> if c == '.' then ' ' else c) cProjectVersion
+ghcVersion = versionOf cProjectVersion
+
+-- | A version from its numbers separated by dots; anything else in the
+-- text is ignored.
+versionOf :: String -> Version
+versionOf = mkVersion . map read . filter (not . null) . words . map (\c -> if isDigit c then c else ' ')
 
 -- | Read the main library of the package in a directory. Conditionals are
 -- decided for this machine, the given compiler version and the given flag

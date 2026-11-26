@@ -71,19 +71,33 @@ The module's header comment is not copied, so editing it changes only the facade
 
 ## Packing
 
-One fragment per group gives a module dozens of fragments, and every module costs GHC something whether or not it is recompiled. `--pack N` packs groups into fragments of at least N lines:
+One fragment per group gives a module dozens of fragments, and every module costs GHC something whether or not it is recompiled. `--pack MS` packs groups into fragments that take at least MS milliseconds to compile:
 
 ```
-cabal run cabal-shatter -- --split --pack 300 --out SOURCE-DIR FILE ...
-cabal run cabal-shatter -- --report --pack 300 FILE ...
+cabal run cabal-shatter -- --split --pack 150 --costs costs.txt --out SOURCE-DIR FILE ...
+cabal run cabal-shatter -- --report --pack 150 --costs costs.txt FILE ...
 ```
 
 - Groups are packed by level, where a group's level is one more than the highest level it depends on. Groups on one level don't depend on each other, so any of them can share a fragment.
-- A level with at least N lines is packed on its own: a group of N lines or more stays alone and the rest fill fragments in source order.
-- Smaller levels are joined to the levels above them until together they reach N lines, and become one fragment.
+- A level that takes at least MS is packed on its own: a group that takes MS or more stays alone and the rest fill fragments in source order.
+- Cheaper levels are joined to the levels above them until together they take MS, and become one fragment.
 - A module that packs into one fragment is left as one module, with no facade.
 
-Packing trades away some of the saving after an edit, and a fragment's name can change when a declaration is added, since the name comes from the least name in the fragment. `--report --pack N` shows the result before anything is written.
+Packing trades away some of the saving after an edit, and a fragment's name can change when a declaration is added, since the name comes from the least name in the fragment. `--report --pack MS` shows the result before anything is written.
+
+### Where compile times come from
+
+Line counts are a poor guide to compile time: a 50-line record with derived instances can cost more than a 1000-line function. So packing goes by time.
+
+With `--costs FILE`, the times are measured ones. Make the file once from a build in which every group is its own fragment:
+
+1. Split without `--pack`.
+2. Build serially with `-ddump-timings -ddump-to-file -dumpdir DIR`. It has to be serial, with `-j1` for both cabal and GHC: GHC reports the whole process's CPU time, so under `-j` each phase is charged for the other threads' work.
+3. `cabal run cabal-shatter -- --timings DIR > costs.txt`
+
+That build is slow, but the file stays good until the code changes a lot, so it is made far less often than the package is built.
+
+A group with no measurement, and every group when there is no file, gets an estimate from its size: 0.4 ms a line, or 1.35 ms a line for an instance or a declaration with a deriving clause. Those are averages over cabal-install at `-O0` and only a rough guide elsewhere.
 
 ## Importing other modules' fragments
 

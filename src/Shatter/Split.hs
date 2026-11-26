@@ -14,7 +14,6 @@ module Shatter.Split
 
 import Control.Exception (evaluate)
 import Control.Monad (forM, forM_, unless)
-import Data.Char (isAlphaNum, ord)
 import Data.List (intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub, sort, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
@@ -32,7 +31,6 @@ import GHC
   , moduleNameString
   , unLoc
   )
-import Numeric (showHex)
 import Shatter.Graph
   ( Group (..)
   , Item (..)
@@ -40,8 +38,10 @@ import Shatter.Graph
   , Node (..)
   , Used (..)
   , collect
+  , costed
   , declGroups
   , declNodes
+  , fragmentNames
   , pack
   , usedIn
   , usedQualifiers
@@ -107,13 +107,14 @@ data Plan = Plan
 
 -- | Split a parsed module on its own, or say why it can't be split.
 split :: Parsed -> Either String Split
-split = fmap (render Nothing) . plan 0
+split = fmap (render Nothing) . plan 0 mempty
 
 -- | Work out the fragments and their names, or say why the module can't be
--- split. The first argument is the least number of lines to pack into a
--- fragment.
-plan :: Int -> Parsed -> Either String Plan
-plan packed parsed
+-- split. The first argument is the least compile time, in milliseconds,
+-- to pack into a fragment, and the second the measured compile times; see
+-- 'pack' and 'costed'.
+plan :: Double -> Map.Map String Double -> Parsed -> Either String Plan
+plan packed costs parsed
   | not (null splices) = refuse $ "has top-level splices at lines " ++ linesOf splices
   | otherwise = do
       headerEnd <- header
@@ -132,7 +133,7 @@ plan packed parsed
     modName = parsedName parsed
     src = parsedSource parsed
     nodes = declNodes modName (parsedDecls parsed)
-    groups = sortOn groupId . pack packed $ declGroups nodes
+    groups = sortOn groupId . pack packed . fst . costed costs modName $ declGroups nodes
     splices = filter ((== Splice) . nodeKind) nodes
     linesOf = intercalate ", " . map (show . nodeFirstLine)
     refuse why = Left $ modName ++ ": " ++ why ++ ", which the splitter does not handle"
@@ -404,24 +405,6 @@ declSlices headerEnd = Map.fromList . go headerEnd . zip [0 ..]
       (DefD{}, Just (_, final)) -> go final rest
       (_, Just (first, final)) -> (i, (min first (prev + 1), final)) : go final rest
       (_, Nothing) -> go prev rest
-
--- | A module name for each group, from the least name it binds. Naming by
--- binder keeps the other fragments' names the same when a declaration is
--- added or moved.
-fragmentNames :: String -> [Group] -> Map.Map Int String
-fragmentNames modName groups = Map.fromList $ concatMap number byName
-  where
-    byName = Map.toList $ Map.fromListWith (flip (++)) [(base g, [groupId g]) | g <- groups]
-    number (name, [gid]) = [(gid, name)]
-    number (name, gids) = [(gid, name ++ "_" ++ show n) | (gid, n) <- zip gids [1 :: Int ..]]
-    base g = modName ++ ".S_" ++ case sort (groupNames g) of
-      n : _
-        | all (\c -> isAlphaNum c || c == '_' || c == '\'') n -> n
-        | otherwise -> "op_" ++ concatMap (flip showHex "" . ord) n
-      []
-        | not (null $ groupOrphan g) -> "orphans"
-        | otherwise -> "line" ++ show (nodeFirstLine . minimumOn nodeId $ groupNodes g)
-    minimumOn f = foldr1 (\a b -> if f a <= f b then a else b)
 
 -- | What 'writeSplit' did.
 data WriteResult = WriteResult

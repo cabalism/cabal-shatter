@@ -14,6 +14,8 @@ module Shatter.Graph
   , Group (..)
   , declNodes
   , declGroups
+  , fragmentNames
+  , costed
   , pack
   , Used (..)
   , usedQualifiers
@@ -23,11 +25,11 @@ module Shatter.Graph
   , collect
   ) where
 
-import Data.Char (isAlphaNum)
+import Data.Char (isAlphaNum, ord)
 import Data.Data (Data, gmapQ)
 import Data.Foldable (toList)
 import Data.Graph (flattenSCC, stronglyConnComp)
-import Data.List (nub, partition, sortOn)
+import Data.List (nub, partition, sort, sortOn)
 import Data.Map.Lazy qualified as Lazy
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -35,6 +37,7 @@ import Data.Maybe (mapMaybe, maybeToList)
 import Data.Ord (Down (..))
 import Data.Set qualified as Set
 import Data.Typeable (Typeable, cast)
+import Numeric (showHex)
 import GHC.Hs
 import GHC.Types.Name.Occurrence (occNameString)
 import GHC.Types.Name.Reader (RdrName (..), rdrNameOcc)
@@ -74,6 +77,9 @@ data Node = Node
   , nodeLastLine :: Int
   , nodeOrphan :: Bool
   -- ^ An instance whose class and types all come from other modules.
+  , nodeDerives :: Bool
+  -- ^ Whether it is an instance or has a deriving clause. Derived code
+  -- costs far more to compile than its line count suggests.
   }
 
 -- | A name a declaration binds.
@@ -104,6 +110,9 @@ data Group = Group
   -- ^ For a group that is an orphan instance, the names in the instance
   -- head; otherwise empty.
   , groupNodes :: [Node]
+  , groupCost :: Double
+  -- ^ How long it takes to compile, in milliseconds; see 'costed'. Zero
+  -- until then.
   , groupLines :: Int
   , groupNames :: [String]
   -- ^ The names the group binds, in source order.
@@ -131,6 +140,7 @@ declNodes modName = markOrphans . mapMaybe node . zip [0 ..]
           , nodeFirstLine = first
           , nodeLastLine = final
           , nodeOrphan = False
+          , nodeDerives = kind == Instance || not (null (collect decl :: [HsDerivingClause GhcPs]))
           }
 
     classify :: HsDecl GhcPs -> Maybe (Kind, [Item], [String])
@@ -278,50 +288,86 @@ declGroups ns = sortOn (Down . groupLines) . orphanDeps $ map group components
                   $ concatMap (\n -> Map.findWithDefault [] (nodeId n) edges) sorted
             , groupOrphan = concat [nodeWith n | n <- sorted, nodeOrphan n]
             , groupNodes = sorted
+            , groupCost = 0
             , groupLines = sum [nodeLastLine n - nodeFirstLine n + 1 | n <- sorted]
             , groupNames = nub $ concatMap nodeBinds sorted
             }
 
--- | Pack groups into fragments of at least a given number of lines, so that
--- a module doesn't turn into dozens of small ones. Every module costs GHC
--- something whether or not it is recompiled.
+-- | A module name for each group, from the least name it binds. Naming by
+-- binder keeps the other fragments' names the same when a declaration is
+-- added or moved.
+fragmentNames :: String -> [Group] -> Map Int String
+fragmentNames modName groups = Map.fromList $ concatMap number byName
+  where
+    byName = Map.toList $ Map.fromListWith (flip (++)) [(base g, [groupId g]) | g <- groups]
+    number (name, [gid]) = [(gid, name)]
+    number (name, gids) = [(gid, name ++ "_" ++ show n) | (gid, n) <- zip gids [1 :: Int ..]]
+    base g = modName ++ ".S_" ++ case sort (groupNames g) of
+      n : _
+        | all isNameChar n -> n
+        | otherwise -> "op_" ++ concatMap (flip showHex "" . ord) n
+      []
+        | not (null $ groupOrphan g) -> "orphans"
+        | otherwise -> "line" ++ show (minimum . map nodeFirstLine $ groupNodes g)
+
+-- | Give each group its compile time in milliseconds, and say how many
+-- were measured.
+--
+-- The times come from an earlier build in which every group was its own
+-- fragment, by fragment name. A group with no measurement gets an estimate
+-- from its size: 0.4 ms a line, or 1.35 ms a line for a declaration that
+-- is an instance or derives one. Those are the averages over cabal-install
+-- at @-O0@, and are only a rough guide elsewhere.
+costed :: Map String Double -> String -> [Group] -> ([Group], Int)
+costed costs modName gs = (map fst priced, length $ filter snd priced)
+  where
+    names = fragmentNames modName gs
+    priced = map price gs
+    price g = case (`Map.lookup` costs) =<< Map.lookup (groupId g) names of
+      Just ms -> (g{groupCost = ms}, True)
+      Nothing -> (g{groupCost = sum $ map estimate (groupNodes g)}, False)
+    estimate n = fromIntegral (nodeLastLine n - nodeFirstLine n + 1) * (if nodeDerives n then 1.35 else 0.4)
+
+-- | Pack groups into fragments that take at least a given time to compile,
+-- in milliseconds, so that a module doesn't turn into dozens of small ones.
+-- Every module costs GHC something whether or not it is recompiled.
 --
 -- Groups are packed by level: a group's level is one more than the highest
 -- level it depends on, so groups on one level don't depend on each other
 -- and any of them can share a fragment. Whole levels can be joined too.
 -- Either way the fragments can't end up depending on each other in a cycle.
 --
--- * A level with at least that many lines is packed on its own: each group
---   that is large enough stays alone, and the rest fill fragments in source
---   order.
--- * Smaller levels are joined to the levels above them until together they
---   are large enough, and become one fragment.
-pack :: Int -> [Group] -> [Group]
-pack n gs
-  | n <= 0 = gs
+-- * A level that takes at least that long is packed on its own: each group
+--   that is expensive enough stays alone, and the rest fill fragments in
+--   source order.
+-- * Cheaper levels are joined to the levels above them until together they
+--   take long enough, and become one fragment.
+pack :: Double -> [Group] -> [Group]
+pack ms gs
+  | ms <= 0 = gs
   | otherwise = sortOn (Down . groupLines) $ map merge fragments
   where
     byId = Map.fromList [(groupId g, g) | g <- gs]
     -- Each level refers to the levels below it, so the map has to be lazy.
     level = Lazy.map (\g -> 1 + maximum (0 : mapMaybe (`Map.lookup` level) (groupDeps g))) byId :: Map Int Int
     levels = Map.elems $ Map.fromListWith (flip (++)) [(level Map.! groupId g, [g]) | g <- sortOn groupId gs]
-    size = sum . map groupLines
+    cost = sum . map groupCost
 
     fragments = bands [] levels
 
     bands held [] = [held | not (null held)]
     bands held (l : ls)
-      | size l >= n = [held | not (null held)] ++ fill l ++ bands [] ls
-      | size (held ++ l) >= n = (held ++ l) : bands [] ls
+      | cost l >= ms = [held | not (null held)] ++ fill l ++ bands [] ls
+      | cost (held ++ l) >= ms = (held ++ l) : bands [] ls
       | otherwise = bands (held ++ l) ls
 
     fill l =
-      let (large, small) = partition ((>= n) . groupLines) l
+      let (large, small) = partition ((>= ms) . groupCost) l
        in map pure large ++ bins [] small
 
     bins held [] = [held | not (null held)]
     bins held (g : rest)
-      | size (held ++ [g]) >= n && size rest >= n = (held ++ [g]) : bins [] rest
+      | cost (held ++ [g]) >= ms && cost rest >= ms = (held ++ [g]) : bins [] rest
       | otherwise = bins (held ++ [g]) rest
 
     owner = Map.fromList [(groupId g, minimum $ map groupId f) | f <- fragments, g <- f]
@@ -334,7 +380,8 @@ pack n gs
             , groupDeps = nub . filter (/= gid) . mapMaybe (`Map.lookup` owner) $ concatMap groupDeps members
             , groupOrphan = concatMap groupOrphan members
             , groupNodes = sortOn nodeId $ concatMap groupNodes members
-            , groupLines = size members
+            , groupCost = cost members
+            , groupLines = sum $ map groupLines members
             , groupNames = concatMap groupNames members
             }
 

@@ -4,7 +4,8 @@ module Shatter.Report
   ) where
 
 import Data.List (intercalate)
-import Shatter.Graph (Group (..), Kind (..), Node (..), declGroups, declNodes, pack)
+import Data.Map.Strict (Map)
+import Shatter.Graph (Group (..), Kind (..), Node (..), costed, declGroups, declNodes, pack)
 import Shatter.Parse (Parsed (..))
 import Text.PrettyPrint
   ( Doc
@@ -22,12 +23,15 @@ import Text.Printf (printf)
 
 -- | Describe the groups a module would split into. The first argument is
 -- how many of the largest groups to list; 'Nothing' lists them all. The
--- second is the least number of lines to pack into a fragment.
-report :: Maybe Int -> Int -> Parsed -> String
-report top packed parsed = render $ vcat [summary, text "", sizes, text "", largest, problems]
+-- second is the least compile time to pack into a fragment and the third
+-- the measured compile times; see 'pack' and 'costed'.
+report :: Maybe Int -> Double -> Map String Double -> Parsed -> String
+report top packed costs parsed = render $ vcat [summary, text "", sizes, text "", largest, problems]
   where
     nodes = declNodes (parsedName parsed) (parsedDecls parsed)
-    groups = pack packed $ declGroups nodes
+    (priced, measured) = costed costs (parsedName parsed) $ declGroups nodes
+    groups = pack packed priced
+    totalCost = sum $ map groupCost groups
     declLines = sum $ map groupLines groups
     share n = percent n declLines
 
@@ -38,6 +42,8 @@ report top packed parsed = render $ vcat [summary, text "", sizes, text "", larg
         , text "groups:" <+> int (length groups)
         , text "largest group:" <+> maybe (text "none") (\g -> lineCount (groupLines g) <+> parens (text . share $ groupLines g)) (headMay groups)
         , text "expected recompile for a one-line edit:" <+> text (printf "%.0f" expected) <+> text "lines" <+> parens (text $ percentD expected declLines)
+        , text "compile time:" <+> millis totalCost <+> parens (text "measured for" <+> int measured <+> text "of" <+> int (length priced) <+> text "groups, estimated for the rest")
+        , text "expected compile time after a one-line edit:" <+> millis expectedCost
         ]
 
     -- An edit recompiles the group it falls in, and falls in a group in
@@ -46,6 +52,12 @@ report top packed parsed = render $ vcat [summary, text "", sizes, text "", larg
     expected
       | declLines == 0 = 0
       | otherwise = sum [fromIntegral (groupLines g) ^ (2 :: Int) | g <- groups] / fromIntegral declLines
+
+    -- As for lines, but in compile time.
+    expectedCost :: Double
+    expectedCost
+      | declLines == 0 = 0
+      | otherwise = sum [fromIntegral (groupLines g) * groupCost g | g <- groups] / fromIntegral declLines
 
     sizes =
       text "groups by size:"
@@ -64,6 +76,7 @@ report top packed parsed = render $ vcat [summary, text "", sizes, text "", larg
       hsep
         [ lineCount $ groupLines g
         , parens (text . share $ groupLines g) <> text ","
+        , millis (groupCost g) <> text ","
         , int . length $ groupNodes g
         , text "declarations:"
         , text $ names g
@@ -84,6 +97,9 @@ report top packed parsed = render $ vcat [summary, text "", sizes, text "", larg
     orphans = filter nodeOrphan nodes
     splices = filter ((== Splice) . nodeKind) nodes
     linesOf = intercalate ", " . map (show . nodeFirstLine)
+
+millis :: Double -> Doc
+millis ms = text (printf "%.0f" ms) <+> text "ms"
 
 lineCount :: Int -> Doc
 lineCount n = int n <+> text "lines"

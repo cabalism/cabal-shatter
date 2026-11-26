@@ -1,0 +1,4 @@
+packages: .
+
+-- The splitter links the ghc library, so the compiler and the library must match.
+with-compiler: ghc-10.0

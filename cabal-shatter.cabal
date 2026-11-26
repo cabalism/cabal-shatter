@@ -1,0 +1,44 @@
+cabal-version:   3.0
+name:            cabal-shatter
+version:         0.1.0.0
+synopsis:        Split a Haskell module into one module per declaration group
+description:
+  An experiment in faking declaration-level recompilation. GHC recompiles
+  whole modules, so @cabal-shatter@ splits a module on disk into one module
+  per group of mutually dependent declarations. So far it only reports the
+  groups a module would split into.
+
+license:         MPL-2.0
+license-file:    LICENSE
+category:        Development
+build-type:      Simple
+extra-doc-files: README.md
+tested-with:     GHC ==10.0.0.20261109
+
+common shared
+  default-language:   GHC2021
+  default-extensions: LambdaCase
+  ghc-options:        -Wall
+
+library
+  import:          shared
+  hs-source-dirs:  src
+  exposed-modules:
+    Shatter.Graph
+    Shatter.Parse
+    Shatter.Report
+
+  build-depends:
+    , base        >=4.23 && <4.24
+    , containers  >=0.7  && <0.9
+    , ghc         >=10.0 && <10.1
+    , pretty      >=1.1  && <1.2
+    , process     >=1.6  && <1.7
+
+executable cabal-shatter
+  import:         shared
+  hs-source-dirs: app
+  main-is:        Main.hs
+  build-depends:
+    , base
+    , cabal-shatter

@@ -26,6 +26,7 @@ module Shatter.Index
   , textualEntry
   ) where
 
+import Data.Binary (Binary)
 import Data.Char (isAlphaNum, isSpace)
 import Data.List (delete, isPrefixOf)
 import Data.Map.Lazy qualified as Lazy
@@ -34,6 +35,7 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
+import GHC.Generics (Generic)
 import GHC
   ( GhcPs
   , IE (..)
@@ -63,6 +65,9 @@ data Entry
       , unknownInstances :: Bool
       -- ^ Whether it declares any instances, which may be orphans.
       }
+  deriving (Eq, Generic)
+
+instance Binary Entry
 
 data Info = Info
   { infoBinders :: Map String [Bound]
@@ -71,6 +76,9 @@ data Info = Info
   , infoOrphans :: [String]
   -- ^ The fragments that hold its orphan instances.
   }
+  deriving (Eq, Generic)
+
+instance Binary Info
 
 -- | Where a name is bound. The fields after the first are those of
 -- 'Shatter.Graph.Item'.
@@ -82,7 +90,9 @@ data Bound = Bound
   , boundParent :: Maybe String
   , boundNewtype :: Bool
   }
-  deriving (Eq, Ord)
+  deriving (Eq, Ord, Generic)
+
+instance Binary Bound
 
 data Exports = Exports
   { exportsLocal :: Bool
@@ -100,6 +110,9 @@ data Exports = Exports
   , exportsWith :: Set (String, String)
   -- ^ Each type or class with a name in parentheses after it.
   }
+  deriving (Eq, Generic)
+
+instance Binary Exports
 
 data ImportList
   = -- | No list: everything the module exports.
@@ -109,6 +122,9 @@ data ImportList
   | -- | The names hidden, and those of them hidden with @(..)@, which
     -- hides what belongs to them as well.
     Hiding (Set String) (Set String)
+  deriving (Eq, Generic)
+
+instance Binary ImportList
 
 data ImportSpec = ImportSpec
   { importModule :: String
@@ -118,6 +134,9 @@ data ImportSpec = ImportSpec
   , importSource :: Bool
   , importList :: ImportList
   }
+  deriving (Eq, Generic)
+
+instance Binary ImportSpec
 
 importSpec :: ImportDecl GhcPs -> ImportSpec
 importSpec d =

@@ -73,6 +73,7 @@ data Cpp = Cpp
   -- ^ @-D@ and @-I@ options, as the package's @cpp-options@ and
   -- @include-dirs@ give them.
   }
+  deriving (Show)
 
 -- | Parse a file. The extra flags are passed to GHC as if on the command
 -- line, for extensions that the package turns on outside the file, such as

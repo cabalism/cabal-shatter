@@ -1,16 +1,18 @@
 module Main (main) where
 
-import Control.Monad (forM, forM_, unless, when)
+import Control.Monad (forM, unless, when)
 import Data.Either (partitionEithers)
-import Data.List (isPrefixOf, sortOn)
+import Data.Set qualified as Set
+import Data.List (isPrefixOf, partition, sortOn)
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Map.Strict qualified as Map
 import Data.Map.Lazy qualified as Lazy
 import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Ord (Down (..))
 import Shatter.Advise (Advice (..), Piece (..), Unit (..), advise, importsOf, showAdvice)
+import Shatter.Cache (Cache (..), Cached (..), readCache, stampFile, stampOf, writeCache)
 import Shatter.Costs (readCosts, showCosts, timingsUnder)
-import Shatter.Index (Package, package, textualEntry)
+import Shatter.Index (Entry (..), ImportSpec (..), Info (..), Package, package, textualEntry)
 import Shatter.Parse (Cpp (..), parseFile)
 import Shatter.Report (report)
 import Shatter.Shadow (Library (..), findMacros, ghcVersion, mirror, readLibrary, withFragments)
@@ -26,9 +28,9 @@ import Shatter.Split
   , render
   , writeSplit
   )
-import System.Directory (canonicalizePath, createDirectoryIfMissing, doesFileExist)
+import System.Directory (canonicalizePath, createDirectoryIfMissing, doesFileExist, getFileSize, getModificationTime)
 import System.FilePath (makeRelative, takeDirectory, (<.>), (</>))
-import System.Environment (getArgs)
+import System.Environment (getArgs, getExecutablePath)
 import System.Exit (die, exitFailure)
 import System.IO (hPutStr, hPutStrLn, stderr)
 import Text.Read (readMaybe)
@@ -241,59 +243,123 @@ shadow opts out = do
     [makeRelative root $ libDir lib | lib <- libs]
     (concat [map (makeRelative root (libDir lib) </>) (libSourceDirs lib) | lib <- libs])
     (concat [(makeRelative root (libDir lib) </> libCabalFile lib) : [f | (_, _, f) <- files] | (lib, files) <- zip libs located])
+  -- This program by its size and time, which is quicker than hashing it.
+  exe <- do
+    path <- getExecutablePath
+    (,) <$> getFileSize path <*> (show <$> getModificationTime path)
+  costsStamp <- maybe (pure (0, 0)) stampFile $ optCosts opts
   refusals <- forM (zip libs located) $ \(lib, files) -> do
     macros <- findMacros builddirs lib
     let cpp = Cpp (maybe [] pure macros ++ reverse (optMacros opts)) (libCppFlags lib ++ reverse (optCppFlags opts))
         flags = libGhcFlags lib ++ reverse (optGhcFlags opts)
-    attempts <- forM files $ \(_, d, f) -> do
+        cabalFile = libDir lib </> libCabalFile lib
+        cacheFile = outAbs </> ".shatter-cache" </> libId lib
+    -- Everything the split depends on besides the text of each module. If
+    -- any of it differs from the last run, every module is read again.
+    headers <- mapM stampFile $ cppMacros cpp
+    cabalStamp <- stampFile cabalFile
+    let key = stampOf (exe, costsStamp, headers, cabalStamp, pack, flags, cpp, optWithGhc opts, [f | (_, _, f) <- files])
+    old <- readCache cacheFile
+    let before = case old of
+          Just c | cacheKey c == key -> cacheModules c
+          _ -> mempty
+    current <- forM files $ \(m, d, f) -> do
       let file = root </> f
       hasBoot <- doesFileExist $ file ++ "-boot"
-      result <-
-        if hasBoot
-          then pure . Left $ file ++ ": has an hs-boot file, which the splitter does not handle"
-          else parseFile (optWithGhc opts) cpp flags file
-      pure . either (Left . (,,) f file) (Right . (,) d) $ plan pack costs =<< result
-    let (whole, plans) = partitionEithers attempts
-    index <- packageOf [file | (_, file, _) <- whole] $ map snd plans
-    splits <- forM plans $ \(d, p) -> do
-      let s = render (Just index) p
-      _ <- writeSplit (outAbs </> makeRelative root (libDir lib) </> d) s
-      pure s
-    -- A module that can't be split is copied, so that the shadow never
-    -- holds a link where a later run may write.
-    forM_ whole $ \(f, file, _) -> do
-      text <- readFile file
-      let to = outAbs </> f
-      createDirectoryIfMissing True $ takeDirectory to
-      same <- do
-        exists <- doesFileExist to
-        if exists then (== text) <$> (readFile to >>= \t -> length t `seq` pure t) else pure False
-      unless same $ writeFile to text
-    let fragments = concatMap (map fragmentModule . splitFragments) splits
-        cabalFile = libDir lib </> libCabalFile lib
+      (a, b) <- stampFile file
+      pure (m, d, f, hasBoot, (a, if hasBoot then b + 1 else b))
+    let source (_, _, f, _, _) = f
+        readOne x@(m, _, f, hasBoot, _) = do
+          let file = root </> f
+          result <-
+            if hasBoot
+              then pure . Left $ file ++ ": has an hs-boot file, which the splitter does not handle"
+              else parseFile (optWithGhc opts) cpp flags file
+          case plan pack costs =<< result of
+            Right p -> pure (x, Right p, planEntry p)
+            Left msg -> do
+              src <- readFile file
+              pure (x, Left msg, fromMaybe (m, Unknown [] False) $ textualEntry src)
+        (stale, fresh) = partition (\x@(_, _, _, _, stamp) -> fmap cachedStamp (Map.lookup (source x) before) /= Just stamp) current
+    first <- mapM readOne stale
+    -- A module whose text changed may now bind or export different names,
+    -- or keep them in different fragments. If what the package is told
+    -- about it changed, the modules that import it, and those that import
+    -- them, are read and written again as well; if not, nothing outside
+    -- it can change.
+    let told x fragments (name, entry) = case Map.lookup (source x) before of
+          Just c -> cachedName c == name && cachedEntry c == entry && cachedFragments c == fragments
+          Nothing -> False
+        fragmentsOf = either (const []) (map fragmentModule . splitFragments . render Nothing)
+        retold = Set.fromList [fst e | (x, r, e) <- first, not $ told x (fragmentsOf r) e]
+        importsOf' = \case
+          Known info -> map importModule $ infoImports info
+          Unknown is _ -> is
+        spread seen =
+          let more =
+                Set.fromList
+                  [ cachedName c
+                  | x <- fresh
+                  , Just c <- [Map.lookup (source x) before]
+                  , cachedName c `Set.notMember` seen
+                  , any (`Set.member` seen) . importsOf' $ cachedEntry c
+                  ]
+           in if Set.null more then seen else spread (seen <> more)
+        reached = spread retold
+        (again, untouched) = partition (\x -> maybe False ((`Set.member` reached) . cachedName) $ Map.lookup (source x) before) fresh
+    second <- mapM readOne again
+    let readNow = first ++ second
+        kept = [(x, c) | x <- untouched, Just c <- [Map.lookup (source x) before]]
+        index =
+          package . Map.fromList $
+            [(cachedName c, cachedEntry c) | (_, c) <- kept] ++ [e | (_, _, e) <- readNow]
+    written <- forM readNow $ \(x@(_, d, f, _, stamp), r, (name, entry)) -> case r of
+      Right p -> do
+        let s = render (Just index) p
+        _ <- writeSplit (outAbs </> makeRelative root (libDir lib) </> d) s
+        pure (source x, Cached stamp name entry (map fragmentModule $ splitFragments s) Nothing)
+      -- A module that can't be split is copied, so that the shadow never
+      -- holds a link where a later run may write.
+      Left msg -> do
+        text <- readFile $ root </> f
+        let to = outAbs </> f
+        createDirectoryIfMissing True $ takeDirectory to
+        same <- sameText to text
+        unless same $ writeFile to text
+        pure (source x, Cached stamp name entry [] (Just msg))
+    let after = Map.fromList $ written ++ [(source x, c) | (x, c) <- kept]
+        inOrder = mapMaybe ((`Map.lookup` after) . source) current
+        fragments = concatMap cachedFragments inOrder
     original <- readFile cabalFile
     case withFragments fragments original of
       Nothing -> die $ cabalFile ++ ": no library section found to add the fragments to"
       Just text -> do
         let to = outAbs </> makeRelative root cabalFile
-        same <- do
-          exists <- doesFileExist to
-          if exists then (== text) <$> (readFile to >>= \t -> length t `seq` pure t) else pure False
+        same <- sameText to text
         unless same $ writeFile to text
+    writeCache cacheFile $ Cache key after
     hPutStrLn stderr . unwords $
       [ libId lib ++ ":"
       , show $ length files
       , "modules,"
+      , show $ length readNow
+      , "read,"
       , show $ length fragments
       , "fragments,"
-      , show $ length whole
+      , show $ length [() | c <- inOrder, Just _ <- [cachedRefused c]]
       , "left whole"
       ]
     when (macros == Nothing) . hPutStrLn stderr $
       "  no cabal_macros.h found for it: modules that use CPP may fail to preprocess until it has been built once"
-    pure [msg | (_, _, msg) <- whole]
+    pure [msg | (_, Left msg, _) <- readNow]
   mapM_ (hPutStrLn stderr . ("  " ++)) $ concat refusals
   hPutStrLn stderr $ "build with: cabal build --project-dir " ++ out
+
+-- | Whether a file holds this text already.
+sameText :: FilePath -> String -> IO Bool
+sameText file text = do
+  exists <- doesFileExist file
+  if exists then (== text) <$> (readFile file >>= \t -> length t `seq` pure t) else pure False
 
 -- | What every module of the package binds, exports and imports. The files
 -- that couldn't be split are scanned as text.

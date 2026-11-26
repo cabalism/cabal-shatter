@@ -4,7 +4,32 @@ An experiment in faking declaration-level recompilation for Haskell.
 
 GHC recompiles whole modules. `cabal-shatter` is meant to split a module on disk into one module per group of mutually dependent declarations, plus a facade with the original name and exports, so that GHC's ordinary recompilation check rebuilds only the group that was edited.
 
-Three things exist: a report of the groups a module would split into, the split itself, and a shadow of a project in which the split libraries can be built with no change to the project.
+Four things exist: a report of the groups a module would split into, the split itself, a shadow of a project in which the split libraries can be built with no change to the project, and advice on which modules to divide by hand.
+
+## Advice on dividing modules
+
+```
+cabal-shatter --timings DUMP-DIR > times.txt
+cabal-shatter --advise --costs times.txt [--flag NAME] PACKAGE-DIR ...
+```
+
+With enough cores a build takes as long as its longest chain of modules that each import the one before. `--advise` says which modules of each package's main library to divide by hand to shorten that chain, and into what. It changes nothing.
+
+For each package it prints:
+
+- The longest chain as the package stands, and the slowest modules on it.
+- The modules to divide, most useful first. Each has the chain's length once it and those above it are divided, and its proposed pieces: their size, time, the first names each binds, and which other pieces each needs.
+- The longest chain after all of them, and what is left on it. A piece marked as one group of declarations can't be divided: it is usually a large type with its instances.
+
+With several packages, the last line is the longest chain across them, each package waiting for those it depends on.
+
+How it works:
+
+- A module's pieces are its groups of declarations packed by dependency level into about `--pieces N` (default 4) pieces.
+- The list is found by starting with every module divided, dropping the divisions the chain doesn't need, then dropping the rest one at a time, least useful first. `--steps N` keeps the first N.
+- Dividing a module assumes its importers are changed to import only the pieces they use. Which pieces those are is worked out as for `--direct`.
+- Times come from `--costs`: one line per module, as `--timings` writes from the `-ddump-timings` dumps of a serial build (`-j1`) of the package as it stands. A piece's share of its module's time is estimated from its size. Without `--costs` every time is an estimate from size.
+- The figures leave out what a build does besides compiling modules, and the fixed cost of each extra module, about 10 ms.
 
 ## Building a project split
 

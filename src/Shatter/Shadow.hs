@@ -29,6 +29,7 @@ import Distribution.PackageDescription
 import Distribution.PackageDescription qualified as PD
 import Distribution.PackageDescription.Parsec (parseGenericPackageDescriptionMaybe)
 import Distribution.Pretty (prettyShow)
+import Distribution.Types.Dependency (depPkgName)
 import Distribution.System (buildArch, buildOS)
 import Distribution.Types.CondTree (simplifyCondTree)
 import Distribution.Utils.Path (getSymbolicPath)
@@ -53,6 +54,9 @@ data Library = Library
   -- ^ The language and extensions it turns on for every module.
   , libCppFlags :: [String]
   -- ^ Its @cpp-options@ and @include-dirs@.
+  , libName :: String
+  , libDepends :: [String]
+  -- ^ The packages it depends on, by name.
   }
 
 -- | The version of GHC this program was built with, which is the one whose
@@ -83,6 +87,8 @@ readLibrary ghc flags dir = do
                     { libDir = dir
                     , libCabalFile = file
                     , libId = prettyShow (pkgName pid) ++ "-" ++ prettyShow (pkgVersion pid)
+                    , libName = prettyShow $ pkgName pid
+                    , libDepends = map (prettyShow . depPkgName) $ targetBuildDepends bi
                     , libSourceDirs = case map getSymbolicPath $ hsSourceDirs bi of
                         [] -> ["."]
                         ds -> ds

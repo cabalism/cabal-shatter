@@ -5,16 +5,20 @@ import Data.Either (partitionEithers)
 import Data.List (isPrefixOf, sortOn)
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (mapMaybe)
+import Data.Map.Lazy qualified as Lazy
+import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Ord (Down (..))
+import Shatter.Advise (Advice (..), Piece (..), Unit (..), advise, importsOf, showAdvice)
 import Shatter.Costs (readCosts, showCosts, timingsUnder)
 import Shatter.Index (Package, package, textualEntry)
 import Shatter.Parse (Cpp (..), parseFile)
 import Shatter.Report (report)
 import Shatter.Shadow (Library (..), findMacros, ghcVersion, mirror, readLibrary, withFragments)
+import Shatter.Graph (Group (..))
+import Shatter.Parse (Parsed (..))
 import Shatter.Split
   ( Fragment (..)
-  , Plan
+  , Plan (..)
   , Split (..)
   , WriteResult (..)
   , plan
@@ -29,7 +33,7 @@ import System.Exit (die, exitFailure)
 import System.IO (hPutStr, hPutStrLn, stderr)
 import Text.Read (readMaybe)
 
-data Mode = Report | SplitTo FilePath | ListModules | Timings FilePath | Shadow FilePath
+data Mode = Report | SplitTo FilePath | ListModules | Timings FilePath | Shadow FilePath | Advise
 
 data Options = Options
   { optMode :: Mode
@@ -44,6 +48,8 @@ data Options = Options
   , optRoot :: FilePath
   , optBuildDirs :: [FilePath]
   , optFlags :: [(String, Bool)]
+  , optPieces :: Int
+  , optSteps :: Int
   , optFiles :: [FilePath]
   }
 
@@ -54,7 +60,7 @@ main :: IO ()
 main = do
   -- When run as @cabal shatter@, cabal passes the command name first.
   args <- dropWhile (== "shatter") <$> getArgs
-  case parse (Options Report False Nothing Nothing (Just 10) Nothing [] [] [] "." [] [] []) args of
+  case parse (Options Report False Nothing Nothing (Just 10) Nothing [] [] [] "." [] [] 4 0 []) args of
     Left err -> die $ err ++ "\n" ++ usage
     Right opts
       | Timings dir <- optMode opts -> putStr . showCosts =<< timingsUnder dir
@@ -71,6 +77,7 @@ run opts@Options{optMode = Report} = do
   mapM_ (putStrLn . report (optTop opts) (fromMaybe 0 $ optPack opts) costs) parsed
   unless (null failed) exitFailure
 run opts@Options{optMode = Shadow out} = shadow opts out
+run opts@Options{optMode = Advise} = advice opts
 run opts = do
   costs <- maybe (pure mempty) readCosts $ optCosts opts
   -- A module that can't be handled is reported and the rest carry on.
@@ -87,6 +94,7 @@ run opts = do
     Report -> pure ()
     Timings _ -> pure ()
     Shadow _ -> pure ()
+    Advise -> pure ()
     ListModules -> mapM_ (mapM_ (putStrLn . fragmentModule) . splitFragments . render Nothing) plans
     SplitTo root -> do
       index <-
@@ -122,6 +130,88 @@ run opts = do
   unless (null whole) exitFailure
   where
     files = reverse $ optFiles opts
+
+-- | Say which modules of each package to divide for a faster build.
+advice :: Options -> IO ()
+advice opts = do
+  measured <- maybe (pure mempty) readCosts $ optCosts opts
+  root <- canonicalizePath $ optRoot opts
+  dirs <- mapM canonicalizePath . reverse $ optFiles opts
+  let builddirs = case optBuildDirs opts of
+        [] -> [root </> "dist-newstyle"]
+        ds -> ds
+  libs <- forM dirs $ \dir -> either die pure =<< readLibrary ghcVersion (optFlags opts) dir
+  results <- forM libs $ \lib -> do
+    files <- fmap catMaybes . forM (libModules lib) $ \m -> do
+      let path d = libDir lib </> d </> map (\c -> if c == '.' then '/' else c) m <.> "hs"
+      found <- mapM (\d -> (,) (path d) <$> doesFileExist (path d)) $ libSourceDirs lib
+      pure $ (,) m <$> listToMaybe [f | (f, True) <- found]
+    macros <- findMacros builddirs lib
+    let cpp = Cpp (maybe [] pure macros ++ reverse (optMacros opts)) (libCppFlags lib ++ reverse (optCppFlags opts))
+        flags = libGhcFlags lib ++ reverse (optGhcFlags opts)
+    attempts <- forM files $ \(m, file) -> do
+      src <- readFile file
+      result <- parseFile (optWithGhc opts) cpp flags file
+      -- First every group on its own, to size the module; then packed
+      -- into about as many pieces as asked for.
+      pure $ case plan 0 mempty =<< result of
+        Left _ -> Left (m, file, src)
+        Right fine ->
+          let size = sum . map groupCost $ planGroups fine
+           in either (const $ Left (m, file, src)) (\p -> Right (src, fine, size, p)) $
+                plan (size / fromIntegral (optPieces opts)) mempty (planParsed fine)
+    let (unread, plans) = partitionEithers attempts
+    index <- packageOf [file | (_, file, _) <- unread] [p | (_, _, _, p) <- plans]
+    let timeOf m estimate = Map.findWithDefault estimate m measured
+        units =
+          [ Unit m (timeOf m $ 0.4 * fromIntegral (length $ lines src)) (length $ lines src) (importsOf src) [] (importsOf src) 0 []
+          | (m, _, src) <- unread
+          ]
+            ++ [ Unit
+                  { unitName = name
+                  , unitTime = time
+                  , unitLines = parsedLines $ planParsed p
+                  , unitImports = importsOf src
+                  , unitPieces =
+                      [ Piece
+                          { pieceName = fragmentModule f
+                          , pieceTime = groupCost g * time / max 1 size
+                          , pieceLines = groupLines g
+                          , pieceBinds = groupNames g
+                          , pieceImports = importsOf $ fragmentText f
+                          , pieceSingle = groupNames g `elem` map groupNames (planGroups fine)
+                          }
+                      | length (splitFragments s) > 1
+                      , f <- splitFragments s
+                      , g <- planGroups p
+                      , Map.lookup (groupId g) (planNames p) == Just (fragmentModule f)
+                      ]
+                  , unitRest = importsOf $ splitFacade s
+                  , unitGroups = length $ planGroups fine
+                  , unitBinds = concatMap groupNames $ planGroups fine
+                  }
+               | (src, fine, size, p) <- plans
+               , let s = render (Just index) p
+                     name = splitModule s
+                     time = timeOf name size
+               ]
+        result = advise (optSteps opts) units
+    putStrLn $ showAdvice (libId lib) (any ((`Map.member` measured) . unitName) units) units result
+    pure (lib, result)
+  -- A package waits for the packages it depends on.
+  let finish chain = Lazy.fromList [(libName lib, one lib a) | (lib, a) <- results]
+        where
+          table = finish chain
+          one lib a = fst (chain a) + maximum (0 : mapMaybe (`Lazy.lookup` table) (filter (/= libName lib) $ libDepends lib))
+      total chain = maximum . (0 :) . Lazy.elems $ finish chain
+      secs :: Double -> String
+      secs ms = show (fromIntegral (round (ms / 10) :: Int) / 100 :: Double) ++ " s"
+  when (length results > 1) . putStrLn $
+    "all packages, each waiting for those it depends on: "
+      ++ secs (total adviceBefore)
+      ++ " as they stand, "
+      ++ secs (total adviceAfter)
+      ++ " with the modules divided"
 
 -- | Mirror the project and split the main library of each package given.
 shadow :: Options -> FilePath -> IO ()
@@ -230,6 +320,13 @@ parse opts = \case
     | Just k <- readMaybe n -> parse opts{optTop = Just k} rest
     | otherwise -> Left $ "--top needs a number, not " ++ n
   "--with-ghc" : ghc : rest -> parse opts{optWithGhc = Just ghc} rest
+  "--advise" : rest -> parse opts{optMode = Advise} rest
+  "--pieces" : n : rest
+    | Just k <- readMaybe n, k > 1 -> parse opts{optPieces = k} rest
+    | otherwise -> Left $ "--pieces needs a number above one, not " ++ n
+  "--steps" : n : rest
+    | Just k <- readMaybe n -> parse opts{optSteps = k} rest
+    | otherwise -> Left $ "--steps needs a number, not " ++ n
   "--shadow" : dir : rest -> parse opts{optMode = Shadow dir} rest
   "--root" : dir : rest -> parse opts{optRoot = dir} rest
   "--builddir" : dir : rest -> parse opts{optBuildDirs = optBuildDirs opts ++ [dir]} rest
@@ -249,6 +346,8 @@ usage =
     , "       cabal-shatter --split --out SOURCE-DIR [--pack MS] [--costs FILE] [--direct] [GHC] FILE ..."
     , "       cabal-shatter --list-modules [--pack MS] [--costs FILE] [GHC] FILE ..."
     , "       cabal-shatter --timings DUMP-DIR"
+    , "       cabal-shatter --advise [--costs FILE] [--pieces N] [--steps N] [--root PROJECT-DIR]"
+    , "                     [--builddir DIR] [--flag [-]NAME] [GHC] PACKAGE-DIR ..."
     , "       cabal-shatter --shadow OUT-DIR [--root PROJECT-DIR] [--builddir DIR] [--flag [-]NAME]"
     , "                     [--pack MS] [--costs FILE] [GHC] PACKAGE-DIR ..."
     , ""
@@ -263,6 +362,12 @@ usage =
     , "                without one are estimated from their size"
     , "--timings DIR   print the compile time of each module from the .dump-timings files"
     , "                under DIR, for --costs; the build has to be serial and unpacked"
+    , "--advise        say which modules of each package's main library to divide, and into"
+    , "                what, to shorten the longest chain of modules that wait for each"
+    , "                other; --costs gives measured times per module, as --timings writes"
+    , "                them from a serial build of the package as it stands"
+    , "--pieces N      with --advise, divide a module into about N pieces (default 4)"
+    , "--steps N       with --advise, name at most N modules to divide (default: all that help)"
     , "--shadow DIR    mirror the project in DIR with links, and split the main library of"
     , "                each PACKAGE-DIR there, with --direct and --pack 150 unless given;"
     , "                the module list, extensions and CPP options come from the package"

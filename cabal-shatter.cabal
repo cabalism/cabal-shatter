@@ -24,6 +24,7 @@ library
   import:          shared
   hs-source-dirs:  src
   exposed-modules:
+    Shatter.Advise
     Shatter.Costs
     Shatter.Graph
     Shatter.Index

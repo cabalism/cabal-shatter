@@ -13,7 +13,7 @@ module Shatter.Split
   ) where
 
 import Control.Exception (evaluate)
-import Control.Monad (forM, forM_, unless)
+import Control.Monad (forM, forM_, unless, when)
 import Data.Char (isUpper)
 import Data.List (intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub, sort, sortOn)
 import Data.Map.Strict qualified as Map
@@ -71,6 +71,7 @@ import System.Directory
   , doesDirectoryExist
   , doesFileExist
   , listDirectory
+  , pathIsSymbolicLink
   , removeFile
   )
 import System.FilePath (takeDirectory, (<.>), (</>))
@@ -477,7 +478,11 @@ writeSplit root s = do
     createDirectoryIfMissing True $ takeDirectory path
     exists <- doesFileExist path
     same <- if exists then (== text) <$> readFileStrict path else pure False
-    unless same $ writeFile path text
+    unless same $ do
+      -- Never write through a link to a file outside the output.
+      link <- if exists then pathIsSymbolicLink path else pure False
+      when link $ removeFile path
+      writeFile path text
     pure (path, same)
   dirExists <- doesDirectoryExist fragmentDir
   stale <-

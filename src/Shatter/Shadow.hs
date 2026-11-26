@@ -10,7 +10,7 @@ module Shatter.Shadow
   , mirror
   ) where
 
-import Control.Monad (filterM, forM, forM_, when)
+import Control.Monad (filterM, forM, when)
 import Data.ByteString qualified as BS
 import Data.Char (isSpace, toLower)
 import Data.List (isPrefixOf, nub)
@@ -189,8 +189,9 @@ findMacros builddirs lib = listToMaybe . concat <$> mapM under builddirs
 -- the file can't write through to the original.
 --
 -- Build directories are not mirrored, nor is the shadow itself when it is
--- inside the project.
-mirror :: FilePath -> FilePath -> [FilePath] -> [FilePath] -> [FilePath] -> IO ()
+-- inside the project. The result is the project's directories that were
+-- made for real, whose contents a later run has to look at again.
+mirror :: FilePath -> FilePath -> [FilePath] -> [FilePath] -> [FilePath] -> IO [FilePath]
 mirror root out leadTo within leftOut = do
   rootAbs <- canonicalizePath root
   createDirectoryIfMissing True out
@@ -203,7 +204,7 @@ mirror root out leadTo within leftOut = do
           || any (\d -> d == "." || (d ++ "/") `isPrefixOf` r) inside
       go rel = do
         entries <- listDirectory (rootAbs </> rel)
-        forM_ entries $ \e -> do
+        fmap ((normalise (rootAbs </> rel) :) . concat) . forM entries $ \e -> do
           let r = normalise $ rel </> e
               from = rootAbs </> r
               to = outAbs </> r
@@ -213,16 +214,17 @@ mirror root out leadTo within leftOut = do
           isBuildDir <- doesFileExist $ from </> "cache" </> "plan.json"
           exists <- (||) <$> doesPathExist to <*> pathIsLink to
           if
-            | "dist-newstyle" `isPrefixOf` e || isBuildDir || from == outAbs -> pure ()
+            | "dist-newstyle" `isPrefixOf` e || isBuildDir || from == outAbs -> pure []
             | r `elem` omit -> do
                 link <- pathIsLink to
                 when link $ removeFile to
+                pure []
             | isDir && e /= ".git" && real r -> do
                 createDirectoryIfMissing True to
                 go r
-            | exists -> pure ()
-            | isDir -> createDirectoryLink from to
-            | otherwise -> createFileLink from to
+            | exists -> pure []
+            | isDir -> [] <$ createDirectoryLink from to
+            | otherwise -> [] <$ createFileLink from to
   go ""
   where
     pathIsLink p = do

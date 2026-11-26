@@ -96,6 +96,12 @@ A run after the first reads only what changed:
 - When it tells the package something different, as after adding a binding, the modules that import it, and those that import them, are read and written again too.
 - Everything is read again when the `.cabal` file, the macros header, the costs file, the options or this program changes.
 
+Before any of that, a run checks the size and time of every file the last run looked at, and the names in every directory it mirrored:
+
+- If nothing differs, it stops there. This takes a few hundredths of a second.
+- If only some libraries' sources differ, only those libraries are looked at again.
+- Anything else differing, such as a `.cabal` file, the plan, or a file added or removed, means a run over every library.
+
 ## Usage
 
 ```

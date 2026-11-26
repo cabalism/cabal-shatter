@@ -123,9 +123,10 @@ declNodes modName = markOrphans . mapMaybe node . zip [0 ..]
 
     -- The class comes first, so that an instance joins its class when the
     -- module defines it and otherwise the first type in the head that the
-    -- module defines.
+    -- module defines. The context is left out: a constraint synonym in it
+    -- is not somewhere the instance can live.
     instanceHead ty =
-      (located <$> maybeToList (getLHsInstDeclClass_maybe ty)) ++ namesIn modName ty
+      (located <$> maybeToList (getLHsInstDeclClass_maybe ty)) ++ namesIn modName (getLHsInstDeclHead ty)
 
     -- An instance is an orphan when no name in its head is bound here.
     markOrphans ns =
@@ -170,9 +171,9 @@ sigSubjects = \case
 --
 -- A node points at every node that binds a name it uses. A node and the
 -- declaration it has to sit with point at each other, which forces them
--- into one group. When several declarations bind a name in 'nodeWith', the
--- node joins the first of them, so an instance joins its class in
--- preference to its type.
+-- into one group. An instance joins only the first declaration that binds a
+-- name in 'nodeWith', so its class in preference to its type. A signature
+-- or pragma joins all of them, since @f, g :: T@ belongs with both.
 declGroups :: [Node] -> [Group]
 declGroups ns = sortOn (Down . groupLines) $ map group components
   where
@@ -181,7 +182,9 @@ declGroups ns = sortOn (Down . groupLines) $ map group components
 
     lookupAll = concatMap (\name -> Map.findWithDefault [] name binders)
 
-    host n = take 1 . filter (/= nodeId n) . lookupAll $ nodeWith n
+    host n = pick . filter (/= nodeId n) . lookupAll $ nodeWith n
+      where
+        pick = if nodeKind n == Instance then take 1 else nub
 
     back :: Map Int [Int]
     back = Map.fromListWith (++) [(h, [nodeId n]) | n <- ns, h <- host n]

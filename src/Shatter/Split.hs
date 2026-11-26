@@ -117,7 +117,7 @@ split parsed
                  ]
               ++ importBlock
               ++ defaults
-              ++ ["import " ++ nameOf d | d <- sort $ groupDeps g]
+              ++ [sibling $ nameOf d | d <- sort $ groupDeps g]
           place (line, acc, text) (_, s@(first, final)) =
             let body = slice s
              in (line + length body + 1, (line + 1, first, final - first + 1) : acc, text ++ [""] ++ body)
@@ -132,19 +132,21 @@ split parsed
     -- gets a copy.
     defaults = concat [slice s | d <- parsedDecls parsed, DefD{} <- [unLoc d], Just s <- [lineSpan $ getLocA d]]
 
+    -- A fragment is imported under the original module's name as well, so
+    -- that names qualified with it still resolve, and so that an export of
+    -- @module M@ from the facade covers what the fragments define.
+    sibling m = "import " ++ m ++ " as " ++ modName
+
     facade headerEnd fragmentModules =
       unlines $
         ["{-# OPTIONS_GHC -Wno-unused-imports #-}"]
-          ++ (if parsedHasExports parsed then take headerEnd src else generatedHeader fragmentModules)
-          ++ ["import " ++ m | m <- fragmentModules]
+          ++ (if parsedHasExports parsed then take headerEnd src else generatedHeader)
+          ++ map sibling fragmentModules
 
-    -- With no export list the original exported everything it defined, so
-    -- the facade re-exports every fragment.
-    generatedHeader fragmentModules =
+    -- With no export list the original exported everything it defined.
+    generatedHeader =
       pragmas
-        ++ ["module " ++ modName]
-        ++ zipWith (\sep m -> "  " ++ sep ++ " module " ++ m) ("(" : repeat ",") fragmentModules
-        ++ ["  ) where", ""]
+        ++ ["module " ++ modName ++ " (module " ++ modName ++ ") where", ""]
         ++ maybe [] slice (parsedImportLines parsed)
 
 -- | Whether a fragment that mentions the given names could need an import.
@@ -156,6 +158,9 @@ split parsed
 -- nothing (for its instances) is always kept.
 importNeeded :: ImportDecl GhcPs -> Used -> Bool
 importNeeded d used
+  -- Importing the Prelude in any form turns off the implicit import, so
+  -- dropping one would bring every Prelude name back into scope.
+  | moduleNameString (unLoc $ ideclName d) == "Prelude" = True
   | qualifier `Set.member` usedQualifiers used = True
   | ideclQualified d /= NotQualified = False
   | otherwise = case ideclImportList d of

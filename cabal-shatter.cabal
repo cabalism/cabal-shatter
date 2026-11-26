@@ -45,3 +45,4 @@ executable cabal-shatter
   build-depends:
     , base
     , cabal-shatter
+    , directory

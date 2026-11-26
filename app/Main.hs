@@ -5,7 +5,9 @@ import Shatter.Parse (parseFile)
 import Shatter.Report (report)
 import Shatter.Split (Fragment (..), Split (..), WriteResult (..), split, writeSplit)
 import System.Environment (getArgs)
-import System.Exit (die)
+import Control.Monad (unless)
+import System.Directory (doesFileExist)
+import System.Exit (die, exitFailure)
 import System.IO (hPutStrLn, stderr)
 import Text.Read (readMaybe)
 
@@ -27,29 +29,38 @@ main = do
     Left err -> die $ err ++ "\n" ++ usage
     Right opts
       | null (optFiles opts) -> die usage
-      | otherwise -> mapM_ (one opts) . reverse $ optFiles opts
+      | otherwise -> do
+          oks <- mapM (one opts) . reverse $ optFiles opts
+          unless (and oks) exitFailure
   where
-    one opts file =
-      parseFile (optWithGhc opts) (reverse $ optGhcFlags opts) file >>= \case
-        Left err -> die err
-        Right parsed -> case optMode opts of
-          Report -> putStrLn $ report (optTop opts) parsed
-          ListModules -> either die (mapM_ (putStrLn . fragmentModule) . splitFragments) $ split parsed
-          SplitTo root -> case split parsed of
-            Left err -> die err
-            Right s -> do
-              result <- writeSplit root s
-              hPutStrLn stderr . unwords $
-                [ splitModule s ++ ":"
-                , show . length $ splitFragments s
-                , "fragments,"
-                , show . length $ written result
-                , "files written,"
-                , show $ unchanged result
-                , "unchanged,"
-                , show . length $ removed result
-                , "removed"
-                ]
+    -- A module that can't be handled is reported and the rest carry on.
+    refused err = False <$ hPutStrLn stderr err
+
+    one opts file = do
+      hasBoot <- doesFileExist $ file ++ "-boot"
+      if hasBoot
+        then refused $ file ++ ": has an hs-boot file, which the splitter does not handle"
+        else
+          parseFile (optWithGhc opts) (reverse $ optGhcFlags opts) file >>= \case
+            Left err -> refused err
+            Right parsed -> case optMode opts of
+              Report -> True <$ putStrLn (report (optTop opts) parsed)
+              ListModules -> either refused ((True <$) . mapM_ (putStrLn . fragmentModule) . splitFragments) $ split parsed
+              SplitTo root -> either refused ((True <$) . write root) $ split parsed
+
+    write root s = do
+      result <- writeSplit root s
+      hPutStrLn stderr . unwords $
+        [ splitModule s ++ ":"
+        , show . length $ splitFragments s
+        , "fragments,"
+        , show . length $ written result
+        , "files written,"
+        , show $ unchanged result
+        , "unchanged,"
+        , show . length $ removed result
+        , "removed"
+        ]
 
 parse :: Options -> [String] -> Either String Options
 parse opts = \case
